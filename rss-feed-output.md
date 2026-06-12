@@ -464,11 +464,22 @@ func (db *datastore) IsUserSilenced(id int64) (bool, error)
 
 ### 8.1 概念澄清：用户 vs Collection
 
-在 WriteFreely 中，**"用户页面"本质上就是 Collection 页面**，两者是一一对应的关系：
+在 WriteFreely 中，**"用户页面"本质上就是 Collection 页面**，两者通过 `alias = 用户名` 的约定建立关联：
 
-- 每个用户至少有一个默认 Collection（别名 = 用户名）
-- 用户可以创建多个 Collection，每个 Collection 代表一个独立博客
-- 在多用户实例中访问 `/{username}/` 实际上就是访问该用户的主 Collection
+- **用户 (User)**：系统账户实体，存储在 `users` 表，拥有 `username`、`password`、`status` 等账户属性
+- **Collection (博客)**：内容容器实体，存储在 `collections` 表，拥有 `alias`、`title`、`owner_id` 等内容属性
+- **关联关系**：每个用户创建账户时，系统自动创建一个**主 Collection**，其 `alias` 等于用户的 `username`
+- **访问方式**：在多用户实例中访问 `/{username}/` 时，系统用 `username` 作为 `alias` 查找并渲染该 Collection
+
+**数据库关系:**
+```
+users 表                     collections 表
+┌──────────────┐ 1:N      ┌──────────────────────┐
+│ id (PK)      │─────────▶│ id (PK)              │
+│ username     │          │ alias (= username)    │ ← 用户页面访问的核心
+│ ...          │          │ owner_id (FK→users.id)│
+└──────────────┘          └──────────────────────┘
+```
 
 **全局开关定义:** [app.go L65, L451](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/app.go#L65-L65)
 ```go
