@@ -181,6 +181,308 @@ r.Header.Add("Digest", "SHA-256="+base64.StdEncoding.EncodeToString(h.Sum(nil)))
 - 超时：15 秒
 - 实现：[activityPubClient](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L106-L110)
 
+### 2.6 同步返回与异步处理的深度解析
+
+本小节从代码层面**逐行拆解** Follow 请求从入站到返回的完整路径，解释"为什么先回 200、再异步处理"的每一个设计决策。
+
+---
+
+#### 2.6.1 同步阶段：从请求到 200 OK 的完整代码路径
+
+入口函数：[handleFetchCollectionInbox](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L317-L738)
+
+整个处理流程使用 `streams.Resolver` 回调机制驱动。代码中有一个关键标志变量 `responseWritten`，贯穿整个函数：
+
+```go
+var responseWritten bool  // L354：标记 HTTP 响应是否已写入
+```
+
+这个变量的作用是：回调可以选择"提前写响应"，函数末尾通过它判断要不要补写兜底响应。
+
+##### 阶段一：JSON 解码（L360-L368）
+
+```go
+var m map[string]any
+if err := json.NewDecoder(tee).Decode(&m); err != nil {
+    log.Error("Failed decoding JSON: %v", err)
+    return err  // ← 注意：只有 JSON 解码失败才真正返回错误
+}
+```
+
+**注意**：这是整个函数里**唯一会返回非 200 错误**的地方。JSON 都解析不了，说明请求完全非法，返回错误让对方知道。
+
+##### 阶段二：streams.Resolver 分发（L378-L548）
+
+`res.Deserialize(m)` 根据 Activity 的 `type` 字段分发到对应的回调：
+
+```go
+res := &streams.Resolver{
+    LikeCallback:   func(l *streams.Like) error { ... },
+    FollowCallback: func(f *streams.Follow) error { ... },
+    UndoCallback:   func(u *streams.Undo) error { ... },
+    DeleteCallback: func(d *streams.Delete) error { ... },
+}
+if err := res.Deserialize(m); err != nil {
+    // ...
+}
+```
+
+每个回调的返回值是 `error`，它会被 `Deserialize` 原样返回。
+
+##### 阶段三：FollowCallback 内部的 9 个步骤
+
+Follow 回调 [activitypub.go:L428-L476](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L428-L476) 内部的精确执行顺序：
+
+| 步骤 | 代码行 | 操作 | 性质 |
+|------|--------|------|------|
+| 1 | L439-L449 | 从 Follow 提取 ID，生成 Accept 的 ID | 纯内存操作 |
+| 2 | L450 | `a.AppendObject(f.Raw())` - Follow 作为 Accept 的 object | 纯内存操作 |
+| 3 | L451 | `_, to = f.GetActor(0)` - 取出关注者 IRI | 纯内存操作 |
+| 4 | L452-L463 | 取出被关注者 IRI（先试 object IRI，不行试 object 本身） | 纯内存操作 |
+| 5 | L464 | `a.AppendActor(obj)` - 设置 Accept 的 actor | 纯内存操作 |
+| 6 | L467-L473 | 校验 `to` 不为空，然后 `getActor(app, to.String())` | **可能阻塞（网络请求）** |
+| 7 | L474 | `responseWritten = true` | 设置标志位 |
+| 8 | L475 | `impart.RenderActivityJSON(w, m, http.StatusOK)` | **写 HTTP 响应** |
+| 9 | L476 | `return nil` | 回调返回成功 |
+
+**关键观察**：第 6 步 `getActor` 在同步路径上。如果本地没有该用户缓存，这里会发起 2 次 HTTP GET，最多阻塞 30 秒。
+
+**第 8 步的双重作用**：`impart.RenderActivityJSON` 会真正写入 `ResponseWriter`，HTTP 状态码 200，body 是原始 Activity JSON。远程服务器在此刻就收到了 200 OK，可以关闭连接了。
+
+##### 阶段四：回调后的同步处理（L562-L637）
+
+`res.Deserialize` 返回 nil 后，函数继续往下执行。这一段处理**同步活动**：
+
+```go
+if isLike {
+    // 同步写入 remote_likes
+    // ...
+    impart.RenderActivityJSON(w, "", http.StatusOK)
+    return nil
+} else if isUnlike {
+    // 同步删除 remote_likes
+    // ...
+    impart.RenderActivityJSON(w, "", http.StatusOK)
+    return nil
+}
+```
+
+Like 和 Unlike 的数据库操作在**同步路径**完成，完成后才返回 200。这是因为它们只涉及本地数据库写，速度可控。
+
+##### 阶段五：启动 goroutine（L639）
+
+```go
+go func() {
+    // ... 异步发送 Accept + 写入数据库 ...
+}()
+```
+
+**只有 Follow 和 Unfollow 会走到这里**。Like/Unlike 在阶段四已经 `return nil` 了。
+
+##### 阶段六：兜底响应（L730-L735）
+
+```go
+if !responseWritten {
+    impart.RenderActivityJSON(w, "", http.StatusOK)
+}
+return nil
+```
+
+如果没有任何回调写过响应（比如未知的活动类型），在这里兜底返回 200 OK。
+
+---
+
+#### 2.6.2 反序列化错误为什么也返回 200？
+
+代码 [activitypub.go:L549-L560](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L549-L560):
+
+```go
+if err := res.Deserialize(m); err != nil {
+    log.Error("Unable to resolve Activity: %v", err)
+    if t, ok := m["type"]; ok {
+        log.Error("Unhandled activity type: %v", t)
+    }
+    impart.RenderActivityJSON(w, "", http.StatusOK)  // ← 仍然 200
+    return nil
+}
+```
+
+**即使 Deserialize 出错，也返回 200 OK，而且 body 是空字符串。** 这有三个层面的原因：
+
+**原因一：协议层面——ActivityPub 的 inbox 语义**
+
+ActivityPub 规范 [Section 7.1 Inbox](https://www.w3.org/TR/activitypub/#inbox) 规定：
+
+> The server MUST be capable of processing activities, or else return a 5xx type error.
+
+但"处理"不等于"执行"。收到一个不认识的活动类型，不代表投递失败——活动确实送达了，只是本服务器不处理它。返回 2xx 表示"我收到了"，至于"我处理不处理"是另一回事。
+
+**原因二：工程层面——避免重试风暴**
+
+如果返回 4xx 或 5xx，发送方会认为投递失败并重试。对于**未知活动类型**，重试是毫无意义的——再发 100 次还是不认识。但重试会：
+- 浪费双方的带宽和计算资源
+- 如果批量出现未知类型（比如新协议扩展），重试流量可能把服务打满
+- 远程实例的投递队列会被永远堆积（因为永远"失败"）
+
+返回 200 是"**收到了，我不会处理，但别再发了**"的信号。
+
+**原因三：安全层面——不暴露内部状态**
+
+返回特定的错误码可能泄露信息：
+- 404 可能暴露"这个博客不存在"
+- 401 可能暴露"这个博客需要认证"
+- 500 可能暴露"我们出 bug 了"
+
+对所有无法处理的入站活动统一返回 200 OK，是一种最小信息披露原则。
+
+> **对比**：JSON 解码失败（阶段一）是真正的协议级别错误——连基本结构都不对，请求本身无效，所以返回错误。而 Deserialize 失败意味着"结构是合法的 Activity，但我们不认识这个类型"，所以返回 200。
+
+---
+
+#### 2.6.3 为什么 Accept 发送和关注落库都放进 goroutine？
+
+Follow 处理的**两个核心副作用**——发送 Accept 活动和写入关注关系——都被放进了同一个 goroutine [activitypub.go:L639-L728](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L639-L728)。这不是随意的安排，每个决策都有依据。
+
+##### 决策一：Accept 发送必须异步
+
+Accept 活动需要 POST 到远程实例的 inbox，这是一个**出站网络请求**，耗时完全不可控：
+- 快的话：几十毫秒（同区域、低延迟）
+- 慢的话：几秒到十几秒（网络拥塞、对方实例负载高）
+- 最坏：15 秒超时（`activityPubClient` 的超时设置）
+
+如果同步等待 Accept 发送完成，Follow 请求的总耗时就完全被远程实例的速度绑架了。异步发送把"接收 Follow"和"回应 Accept"解耦成两个独立操作。
+
+##### 决策二：数据库写入也放进同一个 goroutine
+
+关注落库（`remotefollows` 表的 INSERT）理论上可以同步做——本地数据库操作很快。但代码选择把它也放进 goroutine，原因有三：
+
+**1. 与 Accept 发送的事务一致性**
+
+如果 Accept 已经发送出去了，但数据库写入失败了怎么办？远程用户会以为关注成功了，但本地没有记录。后续该用户发的活动也不会被投递到本地——这是一种静默的不一致。
+
+把两者放在同一个 goroutine 里，**Accept 先发，DB 后写**：
+- Accept 成功 + DB 成功 → 正常
+- Accept 成功 + DB 失败 → 不一致（但概率低）
+- Accept 失败 + DB 不写 → 一致（用户没收到 Accept，以为还在待处理）
+
+> 注意：代码里的顺序是"先发 Accept，再写 DB"，不是"写 DB 成功再发 Accept"。这意味着如果 Accept 发送成功但 DB 写入失败，远程端会显示已关注，但本地没有记录——这是一个已知的设计权衡。
+
+**2. 避免阻塞同步请求**
+
+虽然数据库写入通常很快，但在高并发或数据库慢查询时，单次 INSERT 也可能阻塞。特别是 Follow 涉及三张表的写入（`remoteusers`、`remoteuserkeys`、`remotefollows`），在一个事务中完成。把它放进异步路径，确保 HTTP 响应速度不受数据库瞬时负载影响。
+
+**3. 为未来的批处理留空间**
+
+如果将来要实现关注关系的批量写入或队列化，所有异步操作都在 goroutine 里，更容易重构。
+
+##### 决策三：2 秒延迟的作用
+
+```go
+time.Sleep(2 * time.Second)  // L647
+```
+
+这个固定延迟有两个实际作用：
+
+**1. 确保时序正确性**
+
+远程实例发送 Follow 请求后，需要时间处理 200 OK 响应并准备接收 Accept。如果 Accept 到达得太快，远程端可能还没来得及记录 Follow 活动，收到 Accept 时找不到对应的 Follow，就会丢弃。
+
+2 秒是一个经验值，给远程实例足够的处理窗口。
+
+**2. 流量削峰**
+
+如果瞬间有大量 Follow 请求（比如被大 V 转发带来的关注潮），2 秒延迟可以把 Accept 发送的峰值摊平，降低对远程实例和本地数据库的瞬时压力。
+
+> 代价：正常用户关注后需要等 2 秒才能看到"已关注"状态。对社交媒体来说，这是可接受的延迟。
+
+##### 决策四：Like 为什么不同步返回 200 再异步写 DB？
+
+对比 Follow 和 Like 的处理模式可以发现一个有趣的差异：
+
+| 操作 | 写响应的时机 | 数据库写入时机 |
+|------|-------------|---------------|
+| Follow | 回调内（getActor 之后） | 异步 goroutine |
+| Like | DB 写入完成之后 | 同步（在响应之前） |
+
+Like 在 [activitypub.go:L563-L602](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L563-L602) 的处理：
+```go
+if isLike {
+    t, err := app.db.Begin()
+    // ... 插入 remote_likes ...
+    err = t.Commit()
+    impart.RenderActivityJSON(w, "", http.StatusOK)  // ← DB 写完才返回
+    return nil
+}
+```
+
+**为什么 Like 不也先返回 200 再异步写？**
+
+可能的原因：
+1. Like 不需要向远程回发任何活动（没有 Accept/Reject），处理链路短
+2. Like 只涉及一张表的 INSERT，数据库操作快且确定
+3. 设计上的不一致——这可能是历史遗留，两种模式出自不同时期的代码
+
+实际上 Like 的 `getActor` 也可能触发远程 HTTP 请求（最多 30 秒阻塞），所以 Like 的同步处理也并不安全。这是一个**潜在的性能隐患**。
+
+---
+
+#### 2.6.4 同步路径上的 getActor：必要的恶？
+
+前面提到 `getActor` 在同步路径上执行，可能阻塞 30 秒。这是一个明显的设计问题，但不是 bug——而是刻意的权衡。
+
+**为什么不把 getActor 也移到 goroutine 里？**
+
+```go
+// 如果改成这样：
+FollowCallback: func(f *streams.Follow) error {
+    isFollow = true
+    _, to = f.GetActor(0)
+    // 不调 getActor，直接返回
+    return impart.RenderActivityJSON(w, m, http.StatusOK)
+}
+// 然后 goroutine 里再调 getActor
+go func() {
+    fullActor, _, err := getActor(app, to.String())
+    // ... 发 Accept ...
+}()
+```
+
+这样同步阶段就只剩纯内存操作，几毫秒就能返回 200。但代码没这么做，可能的顾虑：
+
+1. **验证成本**：如果 `getActor` 在 goroutine 里失败了（比如 actor 不存在），没有补救手段——远程端会一直等 Accept，但永远等不到。
+2. **信息完整性**：`remoteUser` 变量（本地缓存的用户 ID）也需要在同步阶段拿到，否则 goroutine 里无法判断是"更新现有用户"还是"插入新用户"。
+3. **简单性优先**：先把信息拿齐再返回，逻辑更直观，出错了至少能在日志里看到。
+
+**但这确实是一个设计缺陷**：在最坏情况下（远程实例完全不可达），每个 Follow 请求会阻塞 30 秒，如果有 100 个并发 Follow，请求处理线程会被全部占满。
+
+---
+
+#### 2.6.5 Unfollow 的同步/异步差异
+
+Unfollow（`Undo:Follow`） [activitypub.go:L515-L537](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L515-L537) 的模式与 Follow 基本一致，但有一个关键区别：
+
+```go
+// Follow 用 getActor（可能远程请求）
+fullActor, remoteUser, err = getActor(app, to.String())
+
+// Unfollow 用 getRemoteUser（纯本地）
+remoteUser, err = getRemoteUser(app, to.String())
+```
+
+Unfollow 选择只查本地数据库，不做远程请求：
+
+| 场景 | 行为 | 结果 |
+|------|------|------|
+| 本地有记录 | 异步发 Accept + 删 DB | 正常取消关注 |
+| 本地无记录 | 回调返回 error → 最终仍返回 200 OK | 静默忽略 |
+
+**设计理由**：
+1. 既然用户之前关注过，本地应该有记录（除非记录被清理了）
+2. 取消关注是一个"删除"操作，宁可不处理也不要误处理
+3. 不需要完整的 Actor 信息来发 Accept——`to`（actor IRI）就够了，因为 inbox 地址可以从 IRI 推断？不，实际上还是需要，但代码里 Unfollow 的 goroutine 也用 `fullActor.Inbox`，如果 `fullActor` 是从 `remoteUser.AsPerson()` 构造的，那 inbox 来自本地缓存
+
+> 注意：Unfollow 的 goroutine 里发 Accept 用的是 `fullActor.Inbox`，而 `fullActor` 是通过 `remoteUser.AsPerson()` 从本地记录构造的。如果本地记录的 inbox 地址过时了，Accept 会发错地方。
+
 ---
 
 ## 3. Actor 记录管理
