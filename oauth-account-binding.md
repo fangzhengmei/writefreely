@@ -197,93 +197,152 @@ func configureOauthRoutes(parentHandler *Handler, r *mux.Router,
 
 ---
 
-## 四、远端账号归属约束：数据库层 vs 应用层
+## 四、远端账号归属约束机制与失效边界
 
-> **核心澄清**：`oauth_users` 表的归属约束通过**数据库唯一索引**和**应用层先查后插**的**双层机制**实现，两层保护的维度**不同**。
+本章分成两个独立部分说明：
+- **4.1-4.3 节：正常流程下（串行执行、无并发）的归属判断机制** —— 代码是怎么设计的、各层分别做什么
+- **4.4 节：并发/延迟场景下的失效边界** —— 机制在哪些条件下会不成立，具体怎么被打破
 
-### 4.1 数据库层负责的约束
+### 4.1 数据库层的客观约束（来自唯一索引）
 
-数据库唯一索引 `oauth_users_uk(user_id, provider, client_id)` 保证：
+`oauth_users_uk` 唯一索引在 V5 迁移中创建 [v5.go:62](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/migrations/v5.go#L62)：
 
+```sql
+CREATE UNIQUE INDEX oauth_users_uk ON oauth_users (user_id, provider, client_id)
 ```
-一个本地用户 ←(唯一关联)→ 一个 Provider 的一个 Client ID
-```
 
-即：用户 A 不能把同一个 GitLab 应用（app1）绑定两次，但可以绑定 GitLab app1 和 GitLab app2（不同 client_id），也可以绑定 GitLab app1 和 Gitea app1（不同 provider）。
+这条索引由数据库引擎强制执行，具备以下性质：
+- **原子性**：即使并发写入，数据库也只会让第一个请求成功，后续请求返回唯一键冲突
+- **维度是**：`user_id + provider + client_id`
+- **约束语义是**：同一个本地用户，对同一个 Provider 的同一个 Client ID，数据库里最多只有 **一条** 记录
 
-### 4.2 应用层负责的约束
+**这条索引 NOT 做的事：**
+- 不保证 `remote_user_id` 在整张表里唯一
+- 不保证 `(remote_user_id, provider, client_id)` 组合唯一
+- 因此**不能**防止"同一个远程账号被绑定到多个本地用户"
 
-由于数据库层**不保证** `(remote_user_id, provider, client_id)` 唯一，这个约束完全由应用层 [viewOauthCallback](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth.go#L323-L425) 中的逻辑保证。
+### 4.2 应用层的归属判断流程（串行执行时的代码路径）
 
-**应用层约束的核心代码（第 355-389 行）：**
+数据库层面只做了一部分约束，剩下的归属判断由应用层完成。代码入口是 [viewOauthCallback](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth.go#L323-L425)，关键步骤如下。
+
+#### 步骤 ①：查询归属快照 [database.go:3001-L3011](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/database.go#L3001-L3011)
 
 ```go
-// 第一步：用 remote_user_id 查询是否已绑定
-localUserID, err := h.DB.GetIDForRemoteUser(ctx, 
-    tokenInfo.UserID,    // OAuth Provider 返回的远程用户唯一标识
-    provider, 
-    clientID)
-
-// 第二步：根据查询结果分支处理
-if localUserID != -1 && attachUserID > 0 {
-    // 分支1：远程账号已绑定到其他用户 → 返回冲突
-    if localUserID != attachUserID {
-        addSessionFlash(app, w, r, "This OAuth account is already attached to another user.", nil)
-        return impart.HTTPError{http.StatusFound, "/me/settings"}
-    }
-    // 子情况：localUserID == attachUserID（重复绑定，继续执行会更新 access_token）
-}
-
-if localUserID != -1 {
-    // 分支2：远程账号已绑定 → 直接以该本地用户身份登录
-    user, _ := h.DB.GetUserByID(localUserID)
-    loginOrFail(h.Store, w, r, user)
-    return nil
-}
-
-if attachUserID > 0 {
-    // 分支3：远程账号未绑定 + 当前已登录 → 绑定到当前用户
-    err = h.DB.RecordRemoteUserID(ctx, attachUserID, tokenInfo.UserID, provider, clientID, ...)
-    return impart.HTTPError{http.StatusFound, "/me/settings"}
-}
-
-// 分支4：远程账号未绑定 + 未登录 → 进入注册流程
+// oauth.go 第 355 行
+localUserID, err := h.DB.GetIDForRemoteUser(ctx, tokenInfo.UserID, provider, clientID)
 ```
 
-**[GetIDForRemoteUser](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/database.go#L3001-L3011) 的实现：**
+执行的 SQL：
+```sql
+SELECT user_id FROM oauth_users
+WHERE remote_user_id = ? AND provider = ? AND client_id = ?
+```
+
+查询以 `(remote_user_id, provider, client_id)` 为条件，返回**当前数据库里**该远程账号对应的本地 `user_id`，如果不存在返回 `-1`。这里拿到的是"查询那一刻"的快照，**不是锁**，也不是原子操作。
+
+#### 步骤 ②：基于归属快照的分派逻辑 [oauth.go:361-L424](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth.go#L361-L424)
+
+| 条件组合 | 进入分支 | 代码位置 | 分支行为 | 写入发生位置 |
+|---------|---------|---------|---------|-------------|
+| `localUserID != -1` 且 `attachUserID > 0` 且 `localUserID != attachUserID` | 分支 1：绑定冲突 | oauth.go:361-L366 | 返回 "This OAuth account is already attached to another user."，不写入 | 无写入 |
+| `localUserID != -1` 且不满足分支 1 | 分支 2：已有用户登录 | oauth.go:368-L379 | 用 `localUserID` 取用户对象，调用 `loginOrFail`，不写入 `oauth_users` | 无写入 `oauth_users` |
+| `localUserID == -1` 且 `attachUserID > 0` | 分支 3：绑定到当前登录用户 | oauth.go:381-L388 | 调用 `RecordRemoteUserID(attachUserID, ...)` 写入绑定 | **同一次 HTTP 请求内**写入（第 384 行） |
+| `localUserID == -1` 且 `attachUserID == 0` | 分支 4：新用户注册 | oauth.go:391-L424 | 构造注册参数、渲染确认页，**本请求不写入绑定** | **下一次 HTTP 请求** 写入（`viewOauthSignup` 第 144 行） |
+
+**[RecordRemoteUserID](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/database.go#L2987-L2998) 的写入行为**
 
 ```go
-func (db *datastore) GetIDForRemoteUser(ctx context.Context, 
-    remoteUserID, provider, clientID string) (int64, error) {
-    var userID int64 = -1
-    err := db.QueryRowContext(ctx, 
-        "SELECT user_id FROM oauth_users "+
-        "WHERE remote_user_id = ? AND provider = ? AND client_id = ?",
-        remoteUserID, provider, clientID).Scan(&userID)
-    if err != nil && err != sql.ErrNoRows {
-        return -1, err
-    }
-    return userID, nil
+if db.driverName == driverSQLite {
+    _, err = db.ExecContext(ctx, "INSERT OR REPLACE INTO oauth_users ...")
+} else {
+    _, err = db.ExecContext(ctx, "INSERT ... "+db.upsert("user")+" access_token = ?", ...)
 }
 ```
 
-**应用层约束的精确语义：**
+- 只有在 `(user_id, provider, client_id)` 触发 `oauth_users_uk` 唯一索引冲突时才会走 upsert（更新 `access_token`）
+- 如果是第一次写入该三元组，则直接 INSERT 新行
+- **数据库不会检查 `(remote_user_id, provider, client_id)` 是否已经存在于其他行**
 
-同一个 `(remote_user_id, provider, client_id)` → 只能关联到 **一个** `user_id`
+### 4.3 串行非并发场景下的整体效果
 
-如果数据库中已存在该三元组 → 后续所有使用该远程账号的 OAuth 操作（登录或绑定）都会被路由到这个已关联的本地用户。
+当请求一个一个到来（前一个写入完成后，下一个才做步骤 ① 的查询）时，归属判断会表现为：
 
-### 4.3 约束组合表
+| 场景 | 步骤 ① 查询结果 | 进入分支 | 最终结果 |
+|------|---------------|---------|---------|
+| 用户A 绑定 GitLab(app1) 账号X，X 从未绑定过 | `localUserID = -1`，`attachUserID = A` | 分支 3 | 写入 `(user=A, gitlab, app1, X)`。`oauth_users_uk` 不冲突，INSERT 成功 ✓ |
+| 用户A 再次绑定 GitLab(app1) 账号X | `localUserID = A`，`attachUserID = A` | 分支 2 后的分支 3 实际不会走到写入（因为 `localUserID!=-1` 先走分支 2 了，或作为重复绑定继续） | 如触发写入则 `oauth_users_uk` 冲突 → upsert 更新 `access_token` ✓ |
+| 用户B 绑定 GitLab(app1) 账号X，此时 X 已属于 A | `localUserID = A`，`attachUserID = B` | 分支 1 | 返回冲突错误，不写入 ✓ |
+| 用户C 走新注册流程，账号 X 已属于 A | `localUserID = A`，`attachUserID = 0` | 分支 2 | 直接以用户 A 身份登录 ✓ |
+| 用户A 绑定 GitLab(app2) 账号X（不同 client_id） | `localUserID = -1`（查询含 app2，与 app1 不同） | 分支 3 | 写入 `(user=A, gitlab, app2, X)`，查询键不同视为不同身份 ✓ |
 
-| 场景 | 数据库层 | 应用层 | 最终结果 |
-|------|---------|--------|---------|
-| 用户A 绑定 GitLab(app1) 账号X | 插入 `(A, gitlab, app1, X)` ✓ | 查询 X → 未绑定过 ✓ | 成功 |
-| 用户A 再次绑定 GitLab(app1) 账号X | `oauth_users_uk` 冲突 → upsert 更新 `access_token` | 查询 X → 返回 A；`localUserID==attachUserID` → 正常继续 | 刷新 token 成功 |
-| 用户B 绑定 GitLab(app1) 账号X | 若先插入 `(B, gitlab, app1, X)` → **不冲突**（`oauth_users_uk` 只看 `(B, gitlab, app1)`）⚠️ | **但插入前**查询 X → 返回 A → 返回冲突错误 ✓ | 被应用层挡住 |
-| 用户A 绑定 GitLab(app2) 账号X | 插入 `(A, gitlab, app2, X)` ✓ | 查询 X+app2 → 未绑定过 ✓ | 成功（不同 client_id 视为不同身份） |
-| 用户A 绑定 Gitea(app1) 账号X | 插入 `(A, gitea, app1, X)` ✓ | 查询 X+gitea → 未绑定过 ✓ | 成功（不同 provider 视为不同身份） |
+结论：**在"查询 → 写入"之间没有其他请求插入的前提下**，应用层归属判断能把同一个远程账号路由到同一个本地用户，也能正确拒绝把同一个远程账号绑定到多个本地用户。
 
-### 4.4 [RecordRemoteUserID](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/database.go#L2987-L2998) 的 upsert 行为
+### 4.4 归属判断机制的失效边界（并发与延迟）
+
+上面的效果依赖一个隐含前提：**步骤 ① 的查询结果到实际写入之间，数据库状态没有发生变化**。以下两种情况会打破这个前提。
+
+#### 失效场景 ①：绑定请求之间的并发（分支 3 与分支 3 并发）
+
+**条件**：用户 A 和用户 B 同时登录，同时发起"绑定同一个远程账号 X"的操作，两个 `viewOauthCallback` 请求在时间上重叠。
+
+```
+时间轴：
+T1  请求A: 步骤① 执行 GetIDForRemoteUser(X) → 表里尚无 X，返回 localUserID = -1
+T2  请求B: 步骤① 执行 GetIDForRemoteUser(X) → 表里尚无 X，返回 localUserID = -1
+T3  请求A: 基于 localUserID=-1 进入分支 3
+T4  请求B: 基于 localUserID=-1 进入分支 3
+T5  请求A: RecordRemoteUserID → INSERT (user=A, remote=X, gitlab, app1)
+           → oauth_users_uk 检查 (A, gitlab, app1) 未冲突 → 成功写入 ✓
+T6  请求B: RecordRemoteUserID → INSERT (user=B, remote=X, gitlab, app1)
+           → oauth_users_uk 检查 (B, gitlab, app1) 未冲突 → 成功写入 ✓
+
+最终状态：oauth_users 表中存在两条记录：
+  (user=A, remote=X, gitlab, app1)
+  (user=B, remote=X, gitlab, app1)
+→ 同一个远程账号 X 同时绑定到 A 和 B
+```
+
+**为什么数据库没有拦住**：`oauth_users_uk` 的唯一键是 `(user_id, provider, client_id)`，两行的 `user_id` 不同，所以都不冲突。缺少 `UNIQUE(remote_user_id, provider, client_id)` 索引，数据库无法发现重复的远程账号。
+
+**后续症状**：之后的 `GetIDForRemoteUser(X)` 查询不带 `LIMIT 1`，返回哪一行取决于存储引擎——登录身份在 A 和 B 之间不确定。
+
+#### 失效场景 ②：注册流程中的长间隙（分支 4 与其他分支并发）
+
+**条件**：用户 C 走"新用户注册"路径（分支 4）。步骤 ① 的查询发生在 `viewOauthCallback`，但归属的实际写入发生在 `viewOauthSignup` [oauth_signup.go:144](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth_signup.go#L144)——中间隔着一个 HTTP 请求往返（页面渲染、用户填写表单、点击提交）。这个间隙可以是几分钟、几小时甚至更久。
+
+```
+时间轴：
+T1  用户C 访问回调 → viewOauthCallback 步骤① 查询 X → localUserID = -1
+T2  viewOauthCallback 进入分支 4，渲染注册页 → 响应发回给浏览器
+    ── 查询与写入之间的间隙开始 ──
+T3  用户D 也发起了同一个远程账号 X 的 OAuth 登录/绑定
+T4  用户D 的 viewOauthCallback 步骤① 查询 X → localUserID 仍为 -1
+T5  用户D 走分支 3（attach） 或分支 4（注册） → RecordRemoteUserID 写入
+    → 现在 X 属于用户 D
+T6  用户C 才点击"提交"按钮 → POST /oauth/signup
+    → viewOauthSignup 执行步骤：
+        a. CreateUser() → 创建新用户 C
+        b. CreateInvitedUser() → 记录邀请
+        c. RecordRemoteUserID(user=C, remote=X, ...)
+           → oauth_users_uk 检查 (C, gitlab, app1) 未冲突 → 写入成功 ✓
+
+最终状态：X 同时绑定到用户 D（T5 写入）和用户 C（T6 写入）
+```
+
+**这个场景的窗口更大**，因为不需要两个请求在毫秒级重叠——只要用户 C 打开注册页后暂时不提交，任何在这期间完成的 X 账号绑定/注册都会被覆盖。
+
+#### 两种失效场景的共性根源
+
+| 项目 | 代码中的具体体现 |
+|------|----------------|
+| 没有数据库层的反向唯一约束 | 缺少 `UNIQUE(remote_user_id, provider, client_id)` 索引 |
+| 步骤 ① 的查询不是锁 | `GetIDForRemoteUser` 是普通 SELECT，不带 `FOR UPDATE`，不会阻塞其他请求的写入 |
+| 查询和写入不在同一事务 | 分支 3：查询和写入在同一个 handler 中，但不在同一个事务里；分支 4：查询和写入分别在两次不同的 HTTP 请求中 |
+| `RecordRemoteUserID` 不做二次检查 | 写入前不会再查一次"该 `remote_user_id` 是否已被其他 `user_id` 占用" |
+
+---
+
+### 4.5 [RecordRemoteUserID](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/database.go#L2987-L2998) 的 upsert 行为
 
 ```go
 func (db *datastore) RecordRemoteUserID(ctx context.Context, 
@@ -525,17 +584,17 @@ viewOauthSignup()
 
 ### 7.1 数据模型层风险
 
-**风险 1：缺少 `UNIQUE(remote_user_id, provider, client_id)` 索引 → TOCTOU 竞态漏洞**
+**风险 1：缺少 `UNIQUE(remote_user_id, provider, client_id)` 索引 + 应用层先查后插无事务保护 → TOCTOU 竞态漏洞**
 
-- **代码依据**：数据库唯一索引是 `oauth_users_uk(user_id, provider, client_id)` [v5.go:62](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/migrations/v5.go#L62)，不包含 `remote_user_id`
-- **为什么成立**：应用层约束通过"先查 `GetIDForRemoteUser` → 后插 `RecordRemoteUserID`"实现，但查询和插入不在同一个事务中，也没有行锁保护
-- **攻击场景**：用户 A 和 B 同时发起同一个远程账号 X 的绑定流程
-  1. 两者并发执行 `GetIDForRemoteUser(X)` → 都返回 -1（X 尚未绑定）
-  2. 两者都通过应用层检查
-  3. 两者并发执行 `RecordRemoteUserID`：
-     - 用户 A 插入 `(user=A, remote=X, gitlab, app1)` → `oauth_users_uk` 不冲突 ✓
-     - 用户 B 插入 `(user=B, remote=X, gitlab, app1)` → `oauth_users_uk` 不冲突 ✓
-  4. **结果**：同一个远程 OAuth 账号 X 同时绑定到两个不同的本地用户
+- **代码依据**：
+  - 数据库唯一索引是 `oauth_users_uk(user_id, provider, client_id)` [v5.go:62](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/migrations/v5.go#L62)，**不包含** `remote_user_id`
+  - 应用层的检查 `GetIDForRemoteUser` 和写入 `RecordRemoteUserID` 在 `viewOauthCallback` [oauth.go:355-L389](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth.go#L355-L389) 中是两步独立调用，不在同一事务
+- **为什么成立**：见 4.4 节的并发时序分析——两个同时到达的绑定请求，都查到"未绑定"，都能通过应用层检查，都能成功写入（因为 `oauth_users_uk` 不冲突）
+- **攻击场景**：两个用户 A 和 B 同时发起同一个远程账号 X 的绑定或注册流程
+  1. 两者并发执行 `GetIDForRemoteUser(X)` → 同时返回 -1
+  2. 两者都通过分支检查，进入分支 3（绑定）或分支 4（注册）
+  3. 两者分别插入 `(user=A, remote=X, ...)` 和 `(user=B, remote=X, ...)`，数据库不拒绝
+  4. **结果**：同一个远程 OAuth 账号 X 同时绑定到两个本地用户
 - **后续影响**：后续 `GetIDForRemoteUser(X)` 查询不带 `LIMIT 1`，返回哪条记录取决于存储引擎，登录身份不确定
 
 **风险 2：`ValidateOAuthState` 错误被丢弃**
