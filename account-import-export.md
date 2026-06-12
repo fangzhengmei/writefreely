@@ -310,16 +310,380 @@ if app.cfg.App.Federation && coll.ID > 0 {
 
 ---
 
-## 六、账号搬迁建议流程
+## 六、账号搬迁详细分析：字段保留与丢失
 
-基于代码分析，推荐的账号搬迁（从实例 A 迁移到实例 B）流程：
+### 6.1 导出字段完整对照表
 
-### 6.1 导出阶段（源实例 A）
+以下对比数据库中完整字段与实际导出内容的差异，标注每个字段在不同导出格式中的保留情况。
+
+#### 6.1.1 用户字段（User）
+
+| 字段名 | 数据库/结构体 | 完整JSON导出 | 文章导出JSON | 说明 |
+|-------|-------------|-------------|-------------|------|
+| `ID` | `int64` | ❌ 丢失 | ❌ 丢失 | `json:"-"` 标签，内部 ID 不对外暴露 |
+| `Username` | `string` | ✅ 保留 | ❌ 不包含 | 用户名在完整导出中作为 User 字段保留 |
+| `HashedPass` | `[]byte` | ❌ 丢失 | ❌ 丢失 | `json:"-"` 标签，安全考虑不导出密码哈希 |
+| `HasPass` | `bool` | ✅ 保留 | ❌ 不包含 | 标识用户是否设置了密码 |
+| `Email` | `zero.String` | ✅ 保留（加密值） | ❌ 不包含 | 导出的是加密后的密文，无法直接使用 |
+| `Created` | `time.Time` | ✅ 保留 | ❌ 不包含 | 账号创建时间 |
+| `Status` | `UserStatus` | ✅ 保留 | ❌ 不包含 | 账号状态（0=正常, 1=禁言） |
+| `clearEmail` | `string` | ❌ 丢失 | ❌ 丢失 | 内存缓存的解密邮箱，`json:"email"` 标签但值来自加密字段 |
+
+**代码来源：** [users.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/users.go) L66-L76
+
+#### 6.1.2 集合字段（Collection）
+
+| 字段名 | 数据库/结构体 | 完整JSON导出 | 文章导出JSON | CSV导出 | ZIP导出 | 说明 |
+|-------|-------------|-------------|-------------|---------|---------|------|
+| `ID` | `int64` | ❌ 丢失 | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | 内部 ID，`json:"-"` |
+| `Alias` | `string` | ✅ 保留 | ✅ 保留 | ✅ 保留（blog列） | ✅ 保留（目录名） | 集合别名/URL 路径 |
+| `Title` | `string` | ✅ 保留 | ✅ 部分 | ❌ 不包含 | ❌ 不包含 | 集合显示名称 |
+| `Description` | `string` | ✅ 保留 | ✅ 部分 | ❌ 不包含 | ❌ 不包含 | 集合描述 |
+| `Direction` | `string` | ❓部分 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 排版方向 |
+| `Language` | `string` | ❓部分 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 集合默认语言 |
+| `StyleSheet` | `string` | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 自定义 CSS |
+| `Script` | `string` | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 自定义 JS |
+| `Signature` | `string` | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 文章签名/页脚，`json:"-"` |
+| `Public` | `bool` | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 是否公开 |
+| `Visibility` | `collVisibility` | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | `json:"-"`，隐私等级 |
+| `Format` | `string` | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 集合格式/主题 |
+| `Views` | `int64` | ✅ 保留 | ✅ 部分 | ❌ 不包含 | ❌ 不包含 | 访问量统计 |
+| `OwnerID` | `int64` | ❌ 丢失 | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | 所有者 ID，`json:"-"` |
+| `PublicOwner` | `bool` | ❌ 丢失 | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | `json:"-"` |
+| `URL` | `string` | ✅ 保留 | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | 完整 URL |
+| `Monetization` | `string` | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 |  monetization 指针 |
+| `Verification` | `string` | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 验证链接 |
+| `TotalPosts` | `int` | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 文章总数（CollectionObj 字段） |
+
+**代码来源：** [collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/collections.go) L52-L82
+
+#### 6.1.3 文章字段（Post / PublicPost）
+
+| 字段名 | 数据库/结构体 | 完整JSON导出 | 文章JSON导出 | CSV导出 | ZIP导出 | 导入时是否保留 |
+|-------|-------------|-------------|-------------|---------|---------|-------------|
+| `ID` | `string` | ✅ 保留 | ✅ 保留 | ✅ 保留（id列） | ✅ 保留（文件名） | ❌ 重新生成 |
+| `Slug` | `null.String` | ✅ 保留 | ✅ 保留 | ✅ 保留（slug列） | ✅ 保留（文件名） | ⚠️ 可能变更 |
+| `Font` | `string` | ✅ 保留(appearance) | ✅ 保留(appearance) | ❌ 不包含 | ❌ 不包含 | ❌ 固定为 "norm" |
+| `Language` | `zero.String` | ✅ 保留 | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不保留 |
+| `RTL` | `zero.Bool` | ✅ 保留 | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不保留 |
+| `Privacy` | `int64` | ❌ 丢失 | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | `json:"-"` |
+| `OwnerID` | `null.Int` | ❌ 丢失 | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | `json:"-"` |
+| `CollectionID` | `null.Int` | ❌ 丢失 | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | `json:"-"`，通过 collection 字段替代 |
+| `PinnedPosition` | `null.Int` | ❌ 丢失 | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | `json:"-"`，置顶位置 |
+| `Created` | `time.Time` | ✅ 保留 | ✅ 保留 | ✅ 保留（created列） | ✅ 保留（修改时间） | ✅ 可通过 fileDates 保留 |
+| `Updated` | `time.Time` | ✅ 保留 | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 重置为导入时间 |
+| `ViewCount` | `int64` | ✅ 保留(views) | ✅ 保留(views) | ❌ 不包含 | ❌ 不包含 | ❌ 重置为 0 |
+| `LikeCount` | `int64` | ✅ 保留(likes) | ✅ 保留(likes) | ❌ 不包含 | ❌ 不包含 | ❌ 重置为 0 |
+| `Title` | `zero.String` | ✅ 保留 | ✅ 保留 | ✅ 保留（title列） | ✅ 保留（文件首行# 标题） | ✅ 保留 |
+| `Content` | `string` | ✅ 保留(body) | ✅ 保留(body) | ✅ 保留（body列） | ✅ 保留（文件正文） | ✅ 保留 |
+| `Tags` | `[]string` | ✅ 保留 | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ⚠️ 隐含在正文中 |
+| `Images` | `[]string` | ✅ 保留 | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 图片需单独迁移 |
+| `IsPaid` | `bool` | ❌ 丢失 | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | 付费文章标识 |
+
+**代码来源：** [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/posts.go) L103-L144
+
+#### 6.1.4 匿名文章导出的字段差异
+
+**注意：** 匿名文章（`GetAnonymousPosts`）的查询字段比完整文章少。
+
+**完整文章查询字段（`postCols`）：**
+```
+id, slug, text_appearance, language, rtl, privacy, owner_id,
+collection_id, pinned_position, created, updated, view_count, title, content
+```
+
+**匿名文章查询字段（只有 7 个字段）：**
+```
+id, view_count, title, language, created, updated, content
+```
+
+**匿名文章缺失的导出字段：**
+- `slug` - URL 路径
+- `text_appearance` - 字体样式
+- `rtl` - 从右到左排版
+- `privacy` - 隐私等级
+- `collection_id` - 所属集合（本身就是无集合）
+- `pinned_position` - 置顶位置
+
+**代码来源：**
+- 完整查询：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/database.go) L1122
+- 匿名文章：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/database.go) L2141
+
+#### 6.1.5 导出格式字段覆盖矩阵
+
+| 数据类型 | JSON完整导出 | JSON文章导出 | CSV导出 | ZIP导出 | 实际可导入 |
+|---------|-------------|-------------|---------|---------|----------|
+| 用户信息 | ✅ 完整 | ❌ | ❌ | ❌ | ❌ 需手动注册 |
+| 集合列表 | ✅ 完整 | ⚠️ 部分 | ⚠️ 仅别名 | ⚠️ 仅目录名 | ❌ 需手动创建 |
+| 文章内容 | ✅ 完整 | ✅ 完整 | ✅ 完整 | ✅ 完整 | ✅ 通过 TXT 导入 |
+| 文章标题 | ✅ 保留 | ✅ 保留 | ✅ 保留 | ✅ 保留 | ✅ 保留 |
+| 创建时间 | ✅ 保留 | ✅ 保留 | ✅ 保留 | ⚠️ 文件修改时间 | ✅ 通过 fileDates |
+| 更新时间 | ✅ 保留 | ✅ 保留 | ❌ | ❌ | ❌ 重置 |
+| Slug | ✅ 保留 | ✅ 保留 | ✅ 保留 | ⚠️ 文件名含 | ❌ 重新生成 |
+| 字体样式 | ✅ 保留 | ✅ 保留 | ❌ | ❌ | ❌ 固定 norm |
+| 语言设置 | ✅ 保留 | ✅ 保留 | ❌ | ❌ | ❌ 不保留 |
+| 浏览统计 | ✅ 保留 | ✅ 保留 | ❌ | ❌ | ❌ 清零 |
+| 点赞统计 | ✅ 保留 | ✅ 保留 | ❌ | ❌ | ❌ 清零 |
+| 标签 | ✅ 保留 | ✅ 保留 | ❌ | ❌ | ⚠️ 隐含在正文 |
+
+---
+
+### 6.2 导入前置校验：导致整单中断的场景
+
+**前置校验定义：** 在进入文件循环处理之前执行的检查，一旦失败则整个导入请求终止，不处理任何文件。
+
+#### 6.2.1 前置校验清单（按执行顺序）
+
+| 序号 | 校验点 | 代码位置 | 失败表现 | HTTP状态码 | 说明 |
+|-----|-------|---------|---------|-----------|------|
+| 1 | **登录态校验** | 路由层 `handler.User()` [handle.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/handle.go) | 返回错误页面/JSON | 401 Unauthorized | 未登录或 Token 无效则直接拦截 |
+| 2 | **Multipart 表单解析** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L59 | Go 内置错误处理 | 通常 400 | `r.ParseMultipartForm(10 << 20)` 解析失败或超过 10MB 限制 |
+| 3 | **目标集合存在性** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L67-L71 | 返回数据库错误 | 500 / 404 | `collAlias` 非空时查询集合，不存在则整单失败 |
+| 4 | **集合所有权校验** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L73-L77 | flash + 错误返回 | 401 | `coll.OwnerID != u.ID` 时禁止导入到他人集合 |
+| 5 | **fileDates JSON 格式** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L82-L86 | Bad Request 错误 | 400 | `json.Unmarshal` 失败则整单中断 |
+
+#### 6.2.2 各校验点详细分析
+
+**1. 登录态校验（路由中间件）**
+- **触发时机**：请求到达 `handleImport` 函数之前
+- **校验逻辑**：`handler.User()` 中间件检查 Session 或 Access Token
+- **失败影响**：直接返回 `ErrNotLoggedIn` 或 `ErrBadAccessToken`，不执行任何导入逻辑
+- **错误返回**：Web 请求重定向到登录页，API 请求返回 JSON 错误
+
+**2. Multipart 表单解析（10MB 限制）**
+```go
+r.ParseMultipartForm(10 << 20)
+```
+- **触发时机**：进入函数后第一行代码
+- **校验逻辑**：Go 标准库 `ParseMultipartForm` 限制请求体大小为 10MB
+- **失败影响**：解析失败直接导致后续所有表单字段为空，可能引发后续错误
+- **注意**：`ParseMultipartForm` 超过限制时 Go 会返回 `ErrMessageTooLarge` 错误，但代码中未检查 `err` 返回值
+
+**3. 目标集合存在性校验**
+```go
+if collAlias != "" {
+    coll, err = app.db.GetCollection(collAlias)
+    if err != nil {
+        log.Error("Unable to get collection for import: %s", err)
+        return err
+    }
+}
+```
+- **触发时机**：解析表单后，文件循环前
+- **校验逻辑**：指定了 `collection` 参数时，查询数据库确认集合存在
+- **失败影响**：直接 `return err`，整单失败
+- **可能原因**：集合别名拼写错误、集合已被删除
+
+**4. 集合所有权校验**
+```go
+if coll.OwnerID != u.ID {
+    err := ErrUnauthorizedGeneral
+    _ = addSessionFlash(app, w, r, err.Message, nil)
+    return err
+}
+```
+- **触发时机**：确认集合存在后
+- **校验逻辑**：验证当前登录用户是集合的所有者
+- **失败影响**：添加 Flash 消息后返回错误，整单失败
+- **安全意义**：防止越权向他人博客导入文章
+
+**5. fileDates JSON 格式校验**
+```go
+fileDates := make(map[string]int64)
+err = json.Unmarshal([]byte(r.FormValue("fileDates")), &fileDates)
+if err != nil {
+    log.Error("invalid form data for file dates: %v", err)
+    return impart.HTTPError{http.StatusBadRequest, "form data for file dates was invalid"}
+}
+```
+- **触发时机**：文件循环前
+- **校验逻辑**：解析前端传入的 `fileDates` JSON 字符串
+- **失败影响**：返回 400 Bad Request，整单失败
+- **失败原因**：前端 JS 异常、恶意构造请求、JSON 格式错误
+
+#### 6.2.3 前置校验失败后的状态
+
+**所有前置校验失败都具有以下共性：**
+- ✅ 数据库中不会创建任何文章
+- ✅ 不会产生任何临时文件
+- ✅ 不会触发任何联邦分发
+- ❌ 不会有 Flash 成功/部分成功消息
+- ❌ 用户需要重新选择文件并提交
+
+---
+
+### 6.3 单文件失败场景分析
+
+**单文件失败定义：** 在文件循环内发生的错误，仅影响当前文件，其他文件继续处理。
+
+**代码结构：** `for _, formFile := range files` 循环内的所有错误都使用 `continue` 跳过当前文件。
+
+#### 6.3.1 单文件失败类型总览
+
+| 类别 | 错误场景 | 错误消息格式 | 是否计入 fileErrs | 反馈方式 |
+|-----|---------|-------------|------------------|---------|
+| **文件操作** | 文件打开失败 | `Unable to read file {filename}` | ✅ 是 | 错误列表 |
+| **文件操作** | 临时文件创建失败 | `Internal error for {filename}` | ✅ 是 | 错误列表 |
+| **文件操作** | 文件复制失败 | `Internal error for {filename}` | ✅ 是 | 错误列表 |
+| **文件操作** | 文件 stat 失败 | `Internal error for {filename}` | ✅ 是 | 错误列表 |
+| **内容解析** | 文件为空 | `{filename} was empty, import skipped` | ❌ 否 | 单独 Flash 提示 |
+| **内容解析** | 不支持的内容类型 | `{filename} is not a supported post file` | ❌ 否 | 单独 Flash 提示 |
+| **内容解析** | 其他解析错误 | `failed to read copy of {filename}` | ✅ 是 | 错误列表 |
+| **数据库** | 创建文章失败 | `failed to create post from {filename}` | ✅ 是 | 错误列表 |
+
+#### 6.3.2 各阶段失败详细分析
+
+**第一阶段：文件读取与临时化（4 种失败）**
+
+```go
+ok := func() bool {
+    file, err := formFile.Open()        // 1. 打开上传的文件
+    // ...
+    tempFile, err := os.CreateTemp(...)  // 2. 创建临时文件
+    // ...
+    _, err = io.Copy(tempFile, file)     // 3. 复制内容到临时文件
+    // ...
+    info, err := tempFile.Stat()         // 4. 获取文件信息
+    // ...
+}()
+if !ok {
+    continue  // 以上任一失败都跳过当前文件
+}
+```
+
+**失败原因与影响：**
+- **文件打开失败**：上传文件损坏、网络中断导致部分上传、文件被占用
+- **临时文件创建失败**：服务器磁盘满、权限问题、临时目录不可写
+- **文件复制失败**：读取过程中连接断开、磁盘 I/O 错误
+- **文件 stat 失败**：罕见的文件系统异常
+
+**共同点：** 都加入 `fileErrs` 错误列表，以 `Internal error` 或 `Unable to read file` 消息呈现给用户。
+
+**第二阶段：内容解析（3 种失败）**
+
+```go
+post, err := wfimport.FromFile(...)
+if err == wfimport.ErrEmptyFile {
+    // 空文件：单独 Flash，不计入错误列表
+    _ = addSessionFlash(app, w, r, fmt.Sprintf("%s was empty, import skipped", formFile.Filename), nil)
+    continue
+} else if err == wfimport.ErrInvalidContentType {
+    // 不支持的类型：单独 Flash，不计入错误列表
+    _ = addSessionFlash(app, w, r, fmt.Sprintf("%s is not a supported post file", formFile.Filename), nil)
+    continue
+} else if err != nil {
+    // 其他解析错误：计入错误列表
+    fileErrs = append(fileErrs, fmt.Errorf("failed to read copy of %s", formFile.Filename))
+    continue
+}
+```
+
+**错误分级设计：**
+- **空文件**：用户可能误传，属于"善意"错误，给予温和提示
+- **不支持的类型**：用户上传了非文本文件，提示格式要求
+- **其他解析错误**：未预期的解析失败，归入技术错误列表
+
+**为什么空文件和类型错误单独提示？**
+- 这类错误通常是用户操作失误，不是系统故障
+- 从错误列表中分离出来，避免用户混淆"真错误"和"小提示"
+- 代码注释：`// not a real error so don't log`
+
+**第三阶段：数据库写入（1 大类，内含重试）**
+
+```go
+rp, err := app.db.CreatePost(u.ID, coll.ID, &submittedPost)
+if err != nil {
+    fileErrs = append(fileErrs, fmt.Errorf("failed to create post from %s", formFile.Filename))
+    log.Error("import textfile: create db post: %v", err)
+    continue
+}
+```
+
+**`CreatePost` 内部的子失败场景：**
+1. **Slug 重复（可恢复）**：
+   - 首次 INSERT 触发唯一键冲突
+   - 自动调用 `GenSafeUniqueSlug()` 生成带后缀的 Slug
+   - 重试一次 INSERT
+   - 重试成功 → 文章正常创建（单文件不失败）
+   - 重试失败 → 进入下面的"其他数据库错误"
+
+2. **其他数据库错误（不可恢复）**：
+   - 数据库连接断开
+   - 约束违反（非 Slug 的唯一键）
+   - 数据截断（内容过长）
+   - 事务超时
+   - 统一表现为 `failed to create post from {filename}`
+
+**第四阶段：联邦分发（异步，不计入失败）**
+
+```go
+if app.cfg.App.Federation && coll.ID > 0 {
+    go federatePost(...)  // 异步执行，不阻塞导入流程
+}
+filesImported++  // 无论联邦成功与否，都算作导入成功
+```
+
+- **性质**：异步 goroutine，后台执行
+- **失败影响**：联邦失败不影响文章已创建的事实
+- **用户感知**：用户无法从导入结果中得知联邦是否成功
+- **日志**：联邦失败会记录到服务端日志，但不返回给用户
+
+#### 6.3.3 错误消息的两种渲染方式
+
+**方式一：错误列表（`fileErrs` 聚合）**
+```go
+if len(fileErrs) != 0 {
+    _ = addSessionFlash(app, w, r, multierror.ListFormatFunc(fileErrs), nil)
+}
+```
+- 使用 `go-multierror` 的 `ListFormatFunc` 格式化为 HTML 列表
+- 在模板中通过 `.Flashes` 渲染为红色错误框
+- 每个错误一行，形如 `* failed to create post from foo.txt`
+
+**方式二：单独 Flash 提示（空文件、类型错误）**
+```go
+_ = addSessionFlash(app, w, r, fmt.Sprintf("%s was empty, import skipped", formFile.Filename), nil)
+```
+- 每个文件单独添加一条 Flash
+- 在模板中也通过 `.Flashes` 渲染
+- 与错误列表混合显示，没有视觉区分
+
+#### 6.3.4 成功/失败计数逻辑
+
+```go
+filesSubmitted := len(files)  // 提交文件总数
+var filesImported int          // 成功导入计数
+// ... 循环处理 ...
+filesImported++  // 只有完全成功（通过 CreatePost）才递增
+```
+
+**计数规则：**
+- 空文件 → `filesSubmitted` 计数，`filesImported` 不计数
+- 类型错误 → `filesSubmitted` 计数，`filesImported` 不计数
+- 其他错误 → `filesSubmitted` 计数，`filesImported` 不计数
+- 成功导入 → 两者都计数
+
+**最终状态判定：**
+```go
+if filesImported == filesSubmitted {
+    // SUCCESS：全部成功
+} else if filesImported > 0 {
+    // INFO：部分成功
+} else {
+    // （无特殊提示）全部失败
+}
+```
+
+---
+
+## 七、账号搬迁建议流程
+
+### 7.1 导出阶段（源实例 A）
 1. 登录实例 A，访问 `/me/export`
 2. 下载完整账号导出：`GET /me/export.json?pretty=1`（保留所有集合和文章结构）
 3. 可选：下载 ZIP 格式备份便于人工阅读
 
-### 6.2 导入阶段（目标实例 B）
+### 7.2 导入阶段（目标实例 B）
 **注意：当前实现没有直接支持 JSON 全量导入的 API！** 需要分步处理：
 
 1. **注册账号**：在实例 B 上注册相同用户名的账号（或任意用户名）
@@ -331,7 +695,7 @@ if app.cfg.App.Federation && coll.ID > 0 {
    - 上传时指定对应 `collection` 参数
    - 确保 `fileDates` JSON 中包含原始创建时间戳
 
-### 6.3 搬迁局限性
+### 7.3 搬迁局限性
 
 | 限制项 | 说明 |
 |-------|------|
@@ -342,6 +706,9 @@ if app.cfg.App.Federation && coll.ID > 0 {
 | **关联数据丢失** | 浏览量、点赞数、评论、订阅者等统计数据不保留 |
 | **OAuth 绑定** | 第三方 OAuth 关联需重新连接 |
 | **集合设置** | 样式表、脚本、签名等自定义设置需手动重建 |
+| **更新时间丢失** | `Updated` 字段重置为导入时间，原修改历史不可追溯 |
+| **字体样式丢失** | 文章的 `text_appearance`（字体风格）统一重置为 `norm` |
+| **置顶状态丢失** | `pinned_position` 不保留，需重新设置置顶 |
 
 ---
 
