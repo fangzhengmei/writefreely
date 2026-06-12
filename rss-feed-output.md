@@ -457,3 +457,359 @@ func (db *datastore) IsUserSilenced(id int64) (bool, error)
 | `shortCodeMore` | `<!--more-->` | 摘要分割标签 | [posts.go L58](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/posts.go#L58-L58) |
 | `shortCodePaid` | `<!--paid-->` | 付费内容标签 | [posts.go L59](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/posts.go#L59-L59) |
 | `shortCodeNoSig` | `<!--nosig-->` | 禁用签名标签 | [posts.go L60](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/posts.go#L60-L60) |
+
+---
+
+## 8. 用户、Collection、实例三种层级的选条目方式辨析
+
+### 8.1 概念澄清：用户 vs Collection
+
+在 WriteFreely 中，**"用户页面"本质上就是 Collection 页面**，两者是一一对应的关系：
+
+- 每个用户至少有一个默认 Collection（别名 = 用户名）
+- 用户可以创建多个 Collection，每个 Collection 代表一个独立博客
+- 在多用户实例中访问 `/{username}/` 实际上就是访问该用户的主 Collection
+
+**全局开关定义:** [app.go L65, L451](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/app.go#L65-L65)
+```go
+isSingleUser bool  // 全局变量，在 Serve() 中根据配置初始化
+isSingleUser = app.cfg.App.SingleUser
+```
+
+---
+
+### 8.2 公开用户页面（多用户模式下的 Collection 页面）
+
+**页面路由:**
+- `/{prefix}{collection}/` → `handleViewCollection`
+- `/{prefix}{collection}/page/{page}` → `handleViewCollection`
+
+**代码位置:** [collections.go L857-L1005](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/collections.go#L857-L1005)
+
+**处理流程:**
+
+1. **请求解析与 Collection 定位:**
+   ```go
+   err := processCollectionRequest(cr, vars, w, r)
+   c, err := processCollectionPermissions(app, cr, u, w, r)
+   ```
+
+2. **数据获取调用:**
+   ```go
+   // 关键参数解析:
+   // page: 页码（从 URL 获取，默认 1）
+   // includeFuture: cr.isCollOwner（只有所有者能看未来文章）
+   // forceRecentFirst: false（可按 Collection 配置的升降序排列）
+   // includePinned: false（排除置顶文章，置顶文章单独获取）
+   coll.Posts, _ = app.db.GetPosts(app.cfg, c, page, cr.isCollOwner, false, false, "")
+   ```
+   **代码位置:** [collections.go L919](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/collections.go#L919-L919)
+
+3. **置顶文章单独处理:**
+   ```go
+   displayPage.PinnedPosts, _ = app.db.GetPinnedPosts(coll.CollectionObj, isOwner)
+   ```
+   置顶文章不参与分页，始终在页面顶部展示。
+
+**排序逻辑差异:**
+- Collection 页面 (`forceRecentFirst=false`): 尊重 Collection 的 `Format.Ascending()` 设置
+  ```go
+  order := "DESC"
+  if cf.Ascending() && !forceRecentFirst {
+      order = "ASC"  // 如果 Collection 配置为升序且不强制最新在前，则升序
+  }
+  ```
+  **代码位置:** [database.go L1307-L1310](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/database.go#L1307-L1310)
+
+- RSS Feed (`forceRecentFirst=true`): **强制降序**，不考虑 Collection 设置
+  ```go
+  // feed.go 调用:
+  coll.Posts, _ = app.db.GetPosts(app.cfg, c, 1, false, true, false, "")
+  //                                   forceRecentFirst ↑ = true
+  ```
+  **代码位置:** [feed.go L70](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/feed.go#L70-L70)
+
+**`includeFuture` 参数对比:**
+| 场景 | 调用者 | `includeFuture` 值 | 效果 |
+|------|--------|-------------------|------|
+| Collection 页面（访客） | `handleViewCollection` | `false` | 不显示未来文章 |
+| Collection 页面（所有者） | `handleViewCollection` | `true` (`cr.isCollOwner`) | 显示未来定时文章 |
+| Collection RSS Feed | `ViewFeed` | `false` | 不显示未来文章 |
+| Reader 页面/Feed | `viewLocalTimeline` | `false` | 不显示未来文章 |
+
+---
+
+### 8.3 单用户顶层 Feed
+
+当配置为 `SingleUser=true` 时，整个实例只服务一个用户，路由和处理方式发生重大变化。
+
+**首页路由:** [app.go L226-L230](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/app.go#L226-L230)
+```go
+func handleViewHome(app *App, w http.ResponseWriter, r *http.Request) error {
+    if app.cfg.App.SingleUser {
+        // 首页直接渲染 Collection 索引页
+        return handleViewCollection(app, w, r)
+    }
+    // ... 多用户模式的其他逻辑
+}
+```
+
+**Collection 级路由注册差异:** [routes.go L208-L214](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/routes.go#L208-L214)
+```go
+if apper.App().cfg.App.SingleUser {
+    // 单用户模式: Collection 路由挂载在根路径
+    RouteCollections(handler, write.PathPrefix("/").Subrouter())
+} else {
+    // 多用户模式: Collection 路由需要前缀，如 /username/
+    write.HandleFunc("/{prefix:[@~$!\\-+]}{collection}", ...)
+    RouteCollections(handler, write.PathPrefix("/{prefix:[@~$!\\-+]?}{collection}").Subrouter())
+}
+```
+
+**Feed 路由含义变化:**
+- **单用户模式**: `/feed/` → 顶层根路径的 Feed，即默认 Collection 的 Feed
+- **多用户模式**: `/{collection}/feed/` → 指定 Collection 的 Feed
+
+**Collection 定位差异:** [feed.go L30-L34](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/feed.go#L30-L34)
+```go
+if app.cfg.App.SingleUser {
+    // 单用户模式: 固定取 ID=1 的 Collection
+    c, err = app.db.GetCollectionByID(1)
+} else {
+    // 多用户模式: 从 URL 路径解析 alias
+    c, err = app.db.GetCollection(alias)
+}
+```
+
+**Canonical URL 差异:** [collections.go L275-L280](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/collections.go#L275-L280)
+```go
+func (c *Collection) RedirectingCanonicalURL(isRedir bool) string {
+    if isSingleUser {
+        return c.hostName + "/"  // 单用户: https://example.com/
+    }
+    return fmt.Sprintf("%s/%s/", c.hostName, c.Alias)  // 多用户: https://example.com/username/
+}
+```
+
+**Feed 中文章链接的差异:**
+| 模式 | 文章链接格式 | 示例 |
+|------|-------------|------|
+| 单用户 | `hostName + "/" + slug` | `https://blog.example.com/my-post` |
+| 多用户 | `hostName + "/" + alias + "/" + slug` | `https://write.example.com/alice/my-post` |
+
+---
+
+### 8.4 实例级 Reader Feed
+
+实例级 Reader Feed 是从全站聚合公开文章，与 Collection 级 Feed 的选条目逻辑有本质不同。
+
+**路由:** `/read/feed/` → `viewLocalTimelineFeed`
+
+**代码位置:** [read.go L292-L344](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L292-L344)
+
+#### 底层查询：`FetchPublicPosts`
+
+**SQL 中的 JOIN 结构:** [read.go L78-L84](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L78-L84)
+```sql
+FROM collections c
+LEFT JOIN posts p ON p.collection_id = c.id   -- 只关联有 Collection 的文章
+LEFT JOIN users u ON u.id = p.owner_id         -- 关联用户表检查状态
+```
+
+**关键特征：**
+1. **从 collections 表出发**：意味着 `collection_id = NULL` 的**匿名文章不会出现在 Reader Feed 中**
+2. **必须是公开 Collection**：`c.privacy = 1` (`CollPublic`)
+3. **用户状态正常**：`u.status = 0`
+
+#### Reader 页面的作者过滤
+
+**代码位置:** [read.go L185-L224](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L185-L224)
+
+```go
+func showLocalTimeline(app *App, ..., page int, author, tag string) error {
+    // ...
+    if author != "" {
+        posts = []PublicPost{}
+        for _, p := range *app.timeline.posts {
+            if author == "anonymous" {
+                // 筛选 "匿名" → p.Collection == nil 的文章
+                // 注意: 由于 SQL 从 collections 出发，实际不会有 p.Collection == nil 的文章
+                if p.Collection == nil {
+                    posts = append(posts, p)
+                }
+            } else if p.Collection != nil && p.Collection.Alias == author {
+                // 按 Collection 别名（即用户名）筛选
+                posts = append(posts, p)
+            }
+        }
+    }
+}
+```
+
+**路由中的 author 参数来源:** [routes.go L249](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/routes.go#L249-L249)
+```go
+r.HandleFunc("/{author}", handler.Web(viewLocalTimeline, readPerm))  // /read/{author}
+```
+
+#### 按作者过滤的三种形式
+
+| URL 模式 | 筛选条件 | 说明 |
+|---------|---------|------|
+| `/read/` | 无过滤 | 所有公开文章聚合 |
+| `/read/{author}` | `p.Collection.Alias == author` | 只显示指定 Collection（用户名）的文章 |
+| `/read/anonymous` | `p.Collection == nil` | 理论上筛选匿名文章，但实际结果为空（因 SQL JOIN 排除） |
+| `/read/t/{tag}` | 按标签内容筛选 | 文章内容包含指定 #标签 |
+
+---
+
+## 9. 匿名文章 vs 具名 Collection 文章
+
+### 9.1 数据库层面的区别
+
+**posts 表字段:** [sqlite.sql L125-L126](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/sqlite.sql#L125-L126)
+```sql
+owner_id INTEGER DEFAULT NULL,       -- NULL = 未认领/无主
+collection_id INTEGER DEFAULT NULL,  -- NULL = 匿名/草稿
+```
+
+| 文章类型 | `collection_id` | `owner_id` | `slug` |
+|---------|-----------------|-----------|--------|
+| 匿名/草稿文章 | `NULL` | 可为 NULL 或有值 | 通常 NULL，使用 `id` 作为 URL 标识 |
+| 具名 Collection 文章 | 有值（对应 collections.id） | 有值（对应用户） | 有语义化的 slug 字符串 |
+
+### 9.2 链接 (URL) 差异
+
+#### 文章 Canonical URL 生成逻辑
+
+**代码位置:** [posts.go L1207-L1212](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/posts.go#L1207-L1212)
+```go
+func (p *PublicPost) CanonicalURL(hostName string) string {
+    if p.Collection == nil || p.Collection.Alias == "" {
+        // 匿名文章: 没有 Collection，使用 ID 访问
+        return hostName + "/" + p.ID + ".md"
+    }
+    // Collection 文章: 使用语义化 slug
+    return p.Collection.CanonicalURL() + p.Slug.String
+}
+```
+
+**对比表:**
+
+| 方面 | 匿名文章 | 具名 Collection 文章 |
+|------|---------|---------------------|
+| **Go 结构判断** | `p.Collection == nil` | `p.Collection != nil` |
+| **URL 标识** | 10 字符 `ID` | 语义化 `slug` |
+| **链接格式 (单用户)** | `/{id}.md` 或 `/d/{id}` (草稿) | `/{slug}` |
+| **链接格式 (多用户)** | `/{id}.md` | `/{alias}/{slug}` |
+| **示例** | `https://example.com/abc123xyz.md` | `https://example.com/alice/my-first-post` |
+
+**草稿 URL 前缀 (单用户模式):** [routes.go L197-L199](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/routes.go#L197-L199)
+```go
+if apper.App().cfg.App.SingleUser {
+    draftEditPrefix = "/d"  // 单用户模式下草稿带 /d 前缀
+}
+```
+
+#### Reader 模板中的链接差异
+
+**代码位置:** [read.tmpl L102, L108](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/templates/read.tmpl#L102-L102)
+```go
+// 日期链接:
+{{if .Collection}}
+    <a href="{{.Collection.CanonicalURL}}{{.Slug.String}}">...</a>
+{{else}}
+    <a href="{{.CanonicalURL .Host}}.md">...</a>
+{{end}}
+
+// "阅读更多" 链接:
+{{if .Collection}}
+    <a href="{{.Collection.CanonicalURL}}{{.Slug.String}}">Read more...</a>
+{{else}}
+    <a href="{{.CanonicalURL .Host}}.md">Read more...</a>
+{{end}}
+```
+
+### 9.3 作者信息差异
+
+#### Reader Feed 中的作者字段
+
+**代码位置:** [read.go L318-L322](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L318-L322)
+```go
+if p.Collection != nil {
+    author = p.Collection.Title    // 用 Collection 标题作为作者
+} else {
+    author = "Anonymous"           // 匿名显示为 "Anonymous"
+}
+```
+
+#### Collection Feed 中的作者字段
+
+**代码位置:** [feed.go L73-L76, L112](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/feed.go#L73-L76)
+```go
+author := ""
+if coll.Owner != nil {
+    author = coll.Owner.Username   // Collection Feed: 直接显示所有者用户名
+}
+```
+
+**对比表:**
+
+| 方面 | 匿名文章 | 具名 Collection 文章 |
+|------|---------|---------------------|
+| **Reader Feed author** | `"Anonymous"` | `p.Collection.Title` (Collection 显示标题) |
+| **Collection Feed author** | N/A (不在此 Feed 出现) | `coll.Owner.Username` (所有者用户名) |
+| **Reader 页面来源显示** | `<em>Anonymous</em>` | `from <a href="...">Collection Title</a>` |
+| **GUID** | `host + /read/a/ + p.ID` | `basePermalinkUrl + p.Slug.String` |
+
+**Reader 模板中的来源信息:** [read.tmpl L105](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/templates/read.tmpl#L105-L105)
+```html
+<p class="source">
+    {{if .Collection}}
+        from <a href="{{.Collection.CanonicalURL}}">{{.Collection.DisplayTitle}}</a>
+    {{else}}
+        <em>Anonymous</em>
+    {{end}}
+</p>
+```
+
+### 9.4 出现在哪些 Feed 中的对比
+
+| Feed 类型 | 匿名文章 (`collection_id=NULL`) | 具名 Collection 文章 |
+|----------|--------------------------------|---------------------|
+| **Collection RSS Feed** (`/{alias}/feed/`) | ❌ 不出现 (WHERE `collection_id = ?`) | ✅ 出现 |
+| **Collection 标签 Feed** | ❌ 不出现 | ✅ 出现 (若含对应标签) |
+| **实例 Reader Feed** (`/read/feed/`) | ❌ 不出现 (SQL 从 `collections` JOIN) | ✅ 仅公开 Collection 的文章 |
+| **Reader 作者筛选 `/read/anonymous`** | ❌ 理论出现但实际为空 | ❌ 不出现 |
+| **Reader 作者筛选 `/read/{alias}`** | ❌ 不出现 | ✅ 出现 |
+| **单篇文章匿名访问** (`/{id}.md`) | ✅ 可直接访问 | ❌ 用 slug 访问 |
+
+### 9.5 总结关系图
+
+```
+WriteFreely 文章发布体系
+│
+├─ 用户 (User)
+│   └── 对应 Account，拥有 1 个或多个 Collection
+│
+├─ Collection (博客/用户页面)
+│   ├── 类型: Unlisted(0) / Public(1) / Private(2) / Protected(4)
+│   ├── 文章来源: owner_id = User.id
+│   ├── 文章特征: collection_id ≠ NULL, 有语义化 slug
+│   ├── 可出现在: Collection页面 + Collection RSS + 公开时可出现在 Reader
+│   └── 作者显示: Collection 标题 / 用户名
+│
+├─ 匿名文章 (Anonymous Post / Draft)
+│   ├── 特征: collection_id = NULL, 用 10 位 ID 标识
+│   ├── 可被认领 (Claim) 为具名文章
+│   ├── 可直接通过 /{id}.md 或 /{id} 访问
+│   ├── 不可出现在任何 RSS Feed
+│   └── 作者显示: "Anonymous" (若出现在 Reader，实际不会)
+│
+└─ Reader (实例聚合阅读器)
+    ├── 数据源: 所有 c.privacy=1 的公开 Collection
+    ├── 排序: 创建时间 DESC
+    ├── 限制: 每作者最多 5 篇，缓存最多 250 篇，Feed 最多 100 篇
+    ├── 按作者筛选: /read/{alias} (按 Collection 别名)
+    └── 按标签筛选: /read/t/{tag}
+```
+
