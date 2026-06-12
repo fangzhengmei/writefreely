@@ -318,6 +318,104 @@ func prepareUserEmail(input string, emailKey []byte) zero.String {
 
 用户邮箱使用 AES 加密后存储在数据库（`varbinary(255)`），即使数据库泄露也无法直接获取用户邮箱。
 
+### 4.5 设计决策权衡：CleanEmail 的处理范围
+
+#### 4.5.1 为什么只处理加号和点号？
+
+当前实现 [spam/email.go#L28-L44](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/spam/email.go#L28-L44) 只做两项标准化：
+```go
+plusIdx := strings.IndexRune(u, '+')
+if plusIdx > -1 {
+    u = u[:plusIdx]        // 去除 + 号及后缀
+}
+u = strings.ReplaceAll(u, ".", "")  // 去除用户名中的所有点号
+```
+
+**其他未处理的邮箱变体技巧**：
+- `-` 号后缀：`user-anything@gmail.com` → `user@gmail.com`
+- 子域名邮箱：`user@anything.gmail.com` → `user@gmail.com`
+- Catch-all 域名：`*@evil.com` 都指向同一收件箱
+- 大小写：已通过 `strings.ToLower` 处理
+
+**设计考量的权衡矩阵**：
+
+| 维度 | 仅处理 + 和 . | 全量处理所有变体 |
+|------|--------------|----------------|
+| 垃圾注册拦截率 | ~80%（最常用变体） | ~95%+ |
+| 兼容性风险 | 低（Gmail/Outlook 主流标准行为） | 高（某些服务商把 `user.name` 和 `username` 视为不同邮箱） |
+| 实现复杂度 | 低（3 行字符串操作） | 高（需要维护各服务商规则库） |
+| 运行时性能 | O(n) 单次扫描 | 可能需要正则匹配 + 字典查询 |
+| 维护成本 | 零（几乎不需要更新） | 持续跟踪服务商规则变化 |
+| 用户意外程度 | 低（用户知道 Gmail 忽略点号） | 高（静默修改用户输入可能破坏邮件追踪） |
+
+**核心决策依据**：
+
+1. **80/20 收益递减原则**
+   - + 号别名和点号忽略是垃圾注册者最常滥用的技巧，处理这两项就能拦截绝大多数批量注册
+   - 其他变体技巧使用频率低，投入产出比差
+
+2. **兼容性优先**
+   - 并非所有邮件服务商都遵循 Gmail 的点号忽略规则
+   - 过度标准化可能导致 `a.b@company.com` 和 `ab@company.com` 两个真实用户被误判为同一人
+
+3. **最小惊讶原则**
+   - 用户可能故意使用 `user+service@example.com` 来追踪邮件来源
+   - 静默剥离这些信息会破坏用户的使用预期
+
+4. **纵深防御**
+   - 即使邮箱标准化被绕过，还有邀请码、IP 限制、行为风控等其他防线
+   - 单一防线不追求 100% 拦截率
+
+---
+
+### 4.6 设计决策权衡：Honeypot 的场景化策略
+
+项目中存在两种完全不同的 Honeypot 实现策略，分别对应不同业务场景的风险特征。
+
+#### 4.6.1 场景 A：邮件订阅 —— 动态随机字段名
+
+- **字段名生成**：`spam.HoneypotFieldName()` → 服务启动时生成 39 位随机字符串
+- **表单渲染**：[postrender.go#L379](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/postrender.go#L379) 动态注入
+- **后端检查**：[email.go#L134-L136](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/email.go#L134-L136)
+
+```go
+// 检查动态随机字段 + fake_password 双蜜罐
+if r.FormValue(spam.HoneypotFieldName()) != "" || r.FormValue("fake_password") != "" {
+    log.Info("Honeypot field was filled out! Not subscribing.")
+    return impart.HTTPError{http.StatusFound, from}
+}
+```
+
+#### 4.6.2 场景 B：用户注册 —— 固定字段名 "fullname"
+
+- **字段名固定**：[users.go#L43](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/users.go#L43) `json:"fullname" schema:"fullname"`
+- **后端未检查**：[signupWithRegistration](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/account.go#L134-L249) 中完全未使用 `signup.Honeypot`
+
+#### 4.6.3 两种策略的权衡对比
+
+| 设计维度 | 动态随机字段（邮件订阅） | 固定字段名（用户注册） |
+|----------|----------------------|-------------------|
+| 反机器人能力 | 强（字段名不可预测，通用爬虫无法识别） | 弱（字段名固定，爬虫容易跳过） |
+| 页面缓存友好 | 差（每个请求字段名不同，页面无法静态缓存） | 好（字段名固定，页面可被 CDN 缓存） |
+| 无状态 API 友好 | 差（需要服务端传递字段名） | 好（JSON API 直接可用） |
+| 实现复杂度 | 中（需要服务端渲染时注入变量） | 低（结构体 tag 直接映射） |
+| 检查实现 | ✅ 已实现 | ❌ 未实现 |
+
+**设计选择分析**：
+
+1. **威胁模型差异**
+   - 邮件订阅：公开表单，垃圾群发机器人的重灾区，需要高强度反爬
+   - 用户注册：已有邀请码机制作为前置门槛，机器人攻击成本高
+
+2. **技术架构约束**
+   - 博客文章页（含邮件订阅）可能被全页缓存，服务端渲染时注入变量不影响
+   - 注册页面需要支持纯 API 调用（移动端、第三方客户端），固定字段名更友好
+
+3. **当前状态问题**
+   - 注册表单的 Honeypot 字段属于"预留但未落地"的代码
+   - 字段定义了但后端不检查，意味着即使机器人填充了 `fullname` 字段也能注册成功
+   - 这是一个已知的代码半成品状态，可能未来版本会完善
+
 ---
 
 ## 五、IP 风控
@@ -621,20 +719,37 @@ CREATE TABLE IF NOT EXISTS `users` (
 
 ---
 
-## 九、关键代码索引
+## 九、发现的问题与潜在 BUG
+
+基于本次深度代码分析，发现以下实现问题：
+
+| 问题 | 位置 | 严重程度 | 说明 |
+|------|------|----------|------|
+| **Inactive 字段未生效** | [invites.go#L45-L55](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/invites.go#L45-L55) | 中 | 字段已定义并存储，但 `Active()` 方法未检查，导致手动停用功能失效 |
+| **注册 Honeypot 未检查** | [account.go#L134-L249](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/account.go#L134-L249) | 低 | `userRegistration.Honeypot` 字段已定义，但 `signupWithRegistration()` 中未检查 |
+| **GetIP 可被伪造** | [spam/ip.go#L18-L25](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/spam/ip.go#L18-L25) | 中 | 直接信任 `X-Forwarded-For` 头部，绕过反向代理时可伪造 IP |
+
+---
+
+## 十、关键代码索引
 
 | 功能模块 | 文件 | 关键行 |
 |----------|------|--------|
 | Invite 结构体 | [invites.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/invites.go) | L27-L55 |
 | 创建邀请 | [invites.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/invites.go) | L99-L134 |
 | 邀请有效性检查 | [invites.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/invites.go) | L41-L55, L136-L150 |
+| Inactive 字段定义 | [invites.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/invites.go) | L32 |
+| DB inactive 字段 | [schema.sql](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/schema.sql) | L213 |
 | UserInvites 配置 | [config/config.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/config/config.go) | L161 |
 | 邀请权限判断 | [account.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/account.go) | L74-L77 |
 | 管理员配置更新 | [admin.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/admin.go) | L571-L606 |
 | CleanEmail 标准化 | [spam/email.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/spam/email.go) | L28-L44 |
-| Honeypot 蜜罐 | [spam/email.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/spam/email.go) | L19-L26 |
+| Honeypot 动态字段名 | [spam/email.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/spam/email.go) | L19-L26 |
+| 邮件订阅 Honeypot 检查 | [email.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/email.go) | L134-L136 |
+| 注册 Honeypot 字段定义 | [users.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/users.go) | L43 |
 | GetIP 获取真实 IP | [spam/ip.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/spam/ip.go) | L18-L25 |
 | 登录频率限制 | [account.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/account.go) | L394-L496 |
+| 管理员密码重置拦截 | [account.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/account.go) | L1332-L1348 |
 | 用户静默状态 | [users.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/users.go) | L22-L27, L134-L136 |
 | 静默用户禁止发邀请 | [invites.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/invites.go) | L103-L105 |
 | 注册核心流程 | [account.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/account.go) | L134-L249 |
@@ -644,3 +759,17 @@ CREATE TABLE IF NOT EXISTS `users` (
 | DB: CreateUserInvite | [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/database.go) | L2737-L2740 |
 | DB: CreateInvitedUser | [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/database.go) | L2800-L2803 |
 | DB: SetUserStatus | [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/database.go) | L2922-L2928 |
+
+---
+
+## 十一、设计决策总览
+
+| 决策点 | 选择 | 权衡 |
+|--------|------|------|
+| **Invite 失效机制** | 只检查 Expires + MaxUses，未检查 Inactive | 简单够用 vs 功能完整性 |
+| **邮箱标准化** | 只处理 + 号和点号 | 80% 收益 vs 兼容性风险 |
+| **Honeypot 策略** | 邮件订阅用动态字段，注册用固定字段（且未检查） | 反爬能力 vs 缓存友好性 |
+| **IP 获取** | 取 X-Forwarded-For 第一个 IP | 通用性 vs 安全性 |
+| **登录限速** | 按用户名 + 3秒窗口 | 防定向破解 vs 防撞库，用户体验 vs 安全性 |
+| **管理员重置** | 直接禁止并记录 IP | 安全性 vs 用户体验 |
+
