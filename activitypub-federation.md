@@ -244,7 +244,63 @@ WriteFreely 提供了三种查询远程用户的入口，分别通过不同的�
 | `getRemoteUserFromHandle` | @user@domain | `handle` | *RemoteUser | [activitypub.go:L1021-L1034](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1021-L1034) |
 | `getRemoteUserFromURL` | 主页 URL | `url` | *RemoteUser | [activitypub.go:L1037-L1051](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1037-L1051) |
 
-三者都是纯本地数据库查询，不涉及网络请求。若记录不存在，返回 `ErrRemoteUserNotFound` 或 `sql.ErrNoRows`。
+三者都是纯本地数据库查询，不涉及网络请求。
+
+#### 3.3.1 找不到记录时的精确返回语义
+
+这三个函数在找不到记录时的返回值**各不相同**，直接影响上游调用者的错误处理逻辑：
+
+| 函数 | `sql.ErrNoRows` 时的返回 | 错误类型 | 具体值 |
+|------|------------------------|---------|--------|
+| `getRemoteUser` | `nil, impart.HTTPError{Status: 404, Message: "No remote user with that ID."}` | 值类型（非指针） | 直接构造 |
+| `getRemoteUserFromHandle` | `nil, ErrRemoteUserNotFound` | 值类型全局变量 | `impart.HTTPError{Status: 404, Message: "Remote user not found."}` |
+| `getRemoteUserFromURL` | `nil, ErrRemoteUserNotFound` | 同上 | 同上 |
+
+**精确代码**：
+
+`getRemoteUser` [activitypub.go:L1005-L1007](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1005-L1007):
+```go
+switch {
+case err == sql.ErrNoRows:
+    return nil, impart.HTTPError{http.StatusNotFound, "No remote user with that ID."}
+```
+
+`getRemoteUserFromHandle` / `getRemoteUserFromURL` [activitypub.go:L1026-L1027](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1026-L1027):
+```go
+case err == sql.ErrNoRows:
+    return nil, ErrRemoteUserNotFound
+```
+
+其中 `ErrRemoteUserNotFound` 定义于 [errors.go:L52](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/errors.go#L52):
+```go
+ErrRemoteUserNotFound = impart.HTTPError{http.StatusNotFound, "Remote user not found."}
+```
+
+#### 3.3.2 为什么返回语义不统一？
+
+`getRemoteUser` 用内联构造而其他两个用 `ErrRemoteUserNotFound`，这是**历史遗留的不一致**，但实际影响不大，因为上游 `getActor` 只通过**类型断言 + Status 码**来判断，不比较 Message：
+
+```go
+if iErr, ok := err.(impart.HTTPError); ok {
+    if iErr.Status == http.StatusNotFound {
+        // 本地没有缓存，转为远程请求
+    }
+}
+```
+
+所以只要 Status 是 404，语义就是"本地不存在"，后续就会触发远程抓取流程。
+
+#### 3.3.3 `getActor` 对 404 的特殊处理
+
+`getActor` 是唯一会"**吃掉 404 错误**"的函数：当 `getRemoteUser` 返回 404 时，它**不向上返回错误**，而是转入远程请求分支。只有以下情况才会把错误向上抛出：
+
+1. 错误不是 `impart.HTTPError` 类型（如数据库连接错误）
+2. 是 `impart.HTTPError` 但 Status 不是 404（几乎不可能发生）
+3. 远程请求过程中发生任何错误（网络超时、解析失败等）→ 包装为 500 错误返回
+
+**关键返回值含义**：`getActor` 返回 `(*Person, *RemoteUser, error)` 的三元组，其中第二返回值 `*RemoteUser` 是否为 nil 有明确含义：
+- 非 nil：本地缓存命中，数据来自 `remoteusers` 表
+- nil：远程请求获取成功，**尚未落库**，需要调用者判断是否要持久化
 
 ### 3.4 Actor 查询流程（getActor）
 
@@ -392,6 +448,55 @@ func (c *Collection) PersonObject(ids ...int64) *activitystreams.Person {
 - 查询 `collectionkeys` 表
 - 不存在则调用 `activitypub.GenerateKeys()` 生成新密钥对
 - 自动插入数据库
+
+### 3.8 远程 Handle 的处理方式
+
+Handle 格式：`@username@domain.tld`（或无前导 `@`）
+
+WriteFreely 通过 `GetProfileURLFromHandle` 函数处理 handle 到 profile URL 的解析，这是一个典型的"缓存优先 + 回源补全"模式。
+
+#### 3.8.1 处理流程全景
+
+函数：[GetProfileURLFromHandle](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1098-L1159)
+
+```
+GetProfileURLFromHandle(handle)
+    │
+    ├─ 非联邦实例检查（silobridge）
+    │     └─ 匹配 → 直接返回第三方平台 URL
+    │
+    ├─ 第一步：按 handle 查本地库 getRemoteUserFromHandle()
+    │     ├─ 命中 → 检查 URL 字段
+    │     │     ├─ URL 非空 → 直接返回 URL
+    │     │     └─ URL 为空 → 远程拉取补全 URL，更新数据库
+    │     └─ 未命中 → 进入第二步
+    │
+    ├─ 第二步：WebFinger 远程解析 RemoteLookup(handle)
+    │     └─ 得到 actor IRI
+    │
+    ├─ 第三步：按 actor IRI 查本地库 getRemoteUser()
+    │     ├─ 命中 → 说明是老数据（有 actor_id 无 handle）
+    │     │     └─ 更新 handle 字段（补全）
+    │     └─ 未命中 → 全新用户
+    │
+    └─ 第四步：全新用户 → activityserve.NewRemoteActor() 拉取
+          └─ 完整插入 remoteusers 表（含 inbox/shared_inbox/url/handle）
+```
+
+#### 3.8.2 核心设计特点
+
+1. **三级回退查找**：handle → actor_id → 远程拉取，层层回退
+2. **惰性补全**：记录可能是不完整的，在使用过程中逐步补全字段
+3. **失败容忍**：handle 更新失败、URL 补全失败都只记日志，不影响主流程
+4. **双路径插入**：
+   - 通过 handle 发现的用户：插入 `remoteusers`（含 handle、不含公钥）
+   - 通过关注/点赞发现的用户：插入 `remoteusers` + `remoteuserkeys`（含公钥、不含 handle）
+
+#### 3.8.3 使用场景
+
+- **博客认证**：用户在博客设置中填写 `@someone@mastodon.social` 作为验证链接，系统解析为 profile URL [database.go:L989-L997](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/database.go#L989-L997)
+- **文章 @提及**：解析文章中提到的联邦用户并单独投递活动
+- **用户搜索**：通过 handle 查找并展示远程用户
 
 ---
 
