@@ -6,9 +6,9 @@ WriteFreely 的数据库系统分为三层抽象，自底向上依次为：
 
 | 层级 | 目录/文件 | 职责 |
 |------|-----------|------|
-| SQL Builder 层 | [db/](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db) | 方言无关的 SQL 语句构建（建表、改表、索引、事务） |
-| 迁移引擎层 | [migrations/](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations) | 版本管理、驱动适配、迁移执行 |
-| 业务数据层 | [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database.go) | 业务 CRUD 操作（用户、文章、集合等） |
+| SQL Builder 层 | [db/](db) | 方言无关的 SQL 语句构建（建表、改表、索引、事务） |
+| 迁移引擎层 | [migrations/](migrations) | 版本管理、驱动适配、迁移执行 |
+| 业务数据层 | [database.go](database.go) | 业务 CRUD 操作（用户、文章、集合等） |
 
 三层之间的调用关系：
 ```
@@ -37,9 +37,9 @@ WriteFreely 支持两种数据库驱动：**MySQL** (`mysql`) 和 **SQLite3** (`
 
 | 文件 | Build Constraint | 适用场景 |
 |------|------------------|----------|
-| [database-sqlite.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database-sqlite.go) | `sqlite && !wflib` | 含 SQLite 支持的完整编译 |
-| [database-no-sqlite.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database-no-sqlite.go) | `!sqlite && !wflib` | 仅 MySQL 的标准编译 |
-| [database-lib.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database-lib.go) | `wflib` | 作为库嵌入的场景（空实现） |
+| [database-sqlite.go](database-sqlite.go) | `sqlite && !wflib` | 含 SQLite 支持的完整编译 |
+| [database-no-sqlite.go](database-no-sqlite.go) | `!sqlite && !wflib` | 仅 MySQL 的标准编译 |
+| [database-lib.go](database-lib.go) | `wflib` | 作为库嵌入的场景（空实现） |
 
 驱动差异的核心函数：
 
@@ -65,7 +65,7 @@ WriteFreely 支持两种数据库驱动：**MySQL** (`mysql`) 和 **SQLite3** (`
 
 通过 `datastore.driverName` 字段在运行时动态切换 SQL 方言，每种差异对应一个独立方法。
 
-**数据类型映射方法**（见 [migrations/drivers.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/drivers.go)）：
+**数据类型映射方法**（见 [migrations/drivers.go](migrations/drivers.go)）：
 
 | 逻辑方法 | MySQL | SQLite |
 |----------|-------|--------|
@@ -84,15 +84,15 @@ WriteFreely 支持两种数据库驱动：**MySQL** (`mysql`) 和 **SQLite3** (`
 
 | 方法 | MySQL | SQLite | 代码位置 |
 |------|-------|--------|----------|
-| `now()` | `NOW()` | `strftime('%Y-%m-%d %H:%M:%S','now')` | [drivers.go#L18-L23](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/drivers.go#L18-L23) |
-| `clip()` | `LEFT(field, l)` | `SUBSTR(field, 0, l)` | [database.go#L167-L172](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database.go#L167-L172) |
-| `upsert()` | `ON DUPLICATE KEY UPDATE` | `ON CONFLICT(cols) DO UPDATE SET` | [database.go#L174-L182](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database.go#L174-L182) |
-| `dateAdd()` | `DATE_ADD(NOW(), INTERVAL n SECOND)` | `DATETIME('now', 'n SECOND')` | [database.go#L184-L189](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database.go#L184-L189) |
-| `dateSub()` | `DATE_SUB(NOW(), INTERVAL n HOUR)` | `DATETIME('now', '-n HOUR')` | [database.go#L191-L196](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database.go#L191-L196) |
-| `tableExists()` | `SHOW TABLES LIKE 't'` | `SELECT name FROM sqlite_master` | [migrations.go#L135-L152](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/migrations.go#L135-L152) |
-| `collateMultiByte()` | `COLLATE utf8_bin` | 空字符串 | [drivers.go#L91-L96](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/drivers.go#L91-L96) |
-| `engine()` | `ENGINE = InnoDB` | 空字符串 | [drivers.go#L98-L103](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/drivers.go#L98-L103) |
-| `after()` | `AFTER col_name` | 空字符串 | [drivers.go#L105-L110](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/drivers.go#L105-L110) |
+| `now()` | `NOW()` | `strftime('%Y-%m-%d %H:%M:%S','now')` | [drivers.go#L18-L23](migrations/drivers.go#L18-L23) |
+| `clip()` | `LEFT(field, l)` | `SUBSTR(field, 0, l)` | [database.go#L167-L172](database.go#L167-L172) |
+| `upsert()` | `ON DUPLICATE KEY UPDATE` | `ON CONFLICT(cols) DO UPDATE SET` | [database.go#L174-L182](database.go#L174-L182) |
+| `dateAdd()` | `DATE_ADD(NOW(), INTERVAL n SECOND)` | `DATETIME('now', 'n SECOND')` | [database.go#L184-L189](database.go#L184-L189) |
+| `dateSub()` | `DATE_SUB(NOW(), INTERVAL n HOUR)` | `DATETIME('now', '-n HOUR')` | [database.go#L191-L196](database.go#L191-L196) |
+| `tableExists()` | `SHOW TABLES LIKE 't'` | `SELECT name FROM sqlite_master` | [migrations.go#L135-L152](migrations/migrations.go#L135-L152) |
+| `collateMultiByte()` | `COLLATE utf8_bin` | 空字符串 | [drivers.go#L91-L96](migrations/drivers.go#L91-L96) |
+| `engine()` | `ENGINE = InnoDB` | 空字符串 | [drivers.go#L98-L103](migrations/drivers.go#L98-L103) |
+| `after()` | `AFTER col_name` | 空字符串 | [drivers.go#L105-L110](migrations/drivers.go#L105-L110) |
 
 **调用方式示例（来自 V1）**：
 ```go
@@ -108,7 +108,7 @@ t.Exec(`CREATE TABLE userinvites (
 
 通过 `DialectType` 枚举 + 强类型 Builder 链式 API 实现类型安全的方言适配。
 
-**类型映射**由 `ColumnType.Format(dialect, size)` 统一处理（见 [db/create.go#L68-L130](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/create.go#L68-L130)）：
+**类型映射**由 `ColumnType.Format(dialect, size)` 统一处理（见 [db/create.go#L68-L130](db/create.go#L68-L130)）：
 
 | ColumnType 枚举 | MySQL | SQLite |
 |-----------------|-------|--------|
@@ -120,7 +120,7 @@ t.Exec(`CREATE TABLE userinvites (
 | `ColumnTypeDateTime` | `DATETIME` | `DATETIME` |
 | `ColumnTypeText` | `TEXT` | `TEXT` |
 
-**方言工厂入口**见 [db/dialect.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/dialect.go)：
+**方言工厂入口**见 [db/dialect.go](db/dialect.go)：
 - `DialectMySQL.Table(name)` → 返回绑定 MySQL 方言的 `CreateTableSqlBuilder`
 - `DialectSQLite.AlterTable(name)` → 返回绑定 SQLite 方言的 `AlterTableSqlBuilder`
 - `DialectMySQL.CreateUniqueIndex(...)` → 返回绑定 MySQL 方言的 `CreateIndexSqlBuilder`
@@ -158,7 +158,7 @@ sql, _ := dialect.Table("oauth_users").
 
 ### 2.3 数据库连接参数差异
 
-在 [connectToDatabase()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/app.go#L847-L875) 中：
+在 [connectToDatabase()](app.go#L847-L875) 中：
 
 - **MySQL**：
   - DSN: `user:pass@tcp(host:port)/db?charset=utf8mb4&parseTime=true&loc=Local&tls=false`
@@ -167,7 +167,7 @@ sql, _ := dialect.Table("oauth_users").
   - DSN: `filename?parseTime=true&cached=shared`，使用自定义驱动 `sqlite3_with_regex`（注册了 `regexp` Go 函数）
   - `SetMaxOpenConns(2)`（SQLite 并发写入能力有限）
 
-驱动注册见 [database-sqlite.go#L25-L36](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database-sqlite.go#L25-L36)：
+驱动注册见 [database-sqlite.go#L25-L36](database-sqlite.go#L25-L36)：
 ```go
 sql.Register("sqlite3_with_regex", &sqlite3.SQLiteDriver{
     ConnectHook: func(conn *sqlite3.SQLiteConn) error {
@@ -178,7 +178,7 @@ sql.Register("sqlite3_with_regex", &sqlite3.SQLiteDriver{
 
 ### 2.4 驱动专属迁移
 
-部分迁移只针对特定驱动执行，例如 [v17/fixPostSignatureCharset()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v17.go#L13-L37)：
+部分迁移只针对特定驱动执行，例如 [v17/fixPostSignatureCharset()](migrations/v17.go#L13-L37)：
 ```go
 func fixPostSignatureCharset(db *datastore) error {
     if db.driverName != driverMySQL {
@@ -188,7 +188,7 @@ func fixPostSignatureCharset(db *datastore) error {
 }
 ```
 
-同理，[v5/oauthSlack()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v5.go#L65-L75) 中修改 `remote_user_id` 列长度的操作**仅在 MySQL 上执行**（SQLite 的 VARBINARY/INTEGER 动态类型无需调整宽度）。
+同理，[v5/oauthSlack()](migrations/v5.go#L65-L75) 中修改 `remote_user_id` 列长度的操作**仅在 MySQL 上执行**（SQLite 的 VARBINARY/INTEGER 动态类型无需调整宽度）。
 
 ---
 
@@ -200,7 +200,7 @@ func fixPostSignatureCharset(db *datastore) error {
 
 #### 模式 1：手写 Begin/Commit/Rollback（13 个迁移）
 
-适用 V1/V2/V3/V6/V9-V17。典型模式（以 [v1/supportUserInvites()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v1.go#L13-L49) 为例）：
+适用 V1/V2/V3/V6/V9-V17。典型模式（以 [v1/supportUserInvites()](migrations/v1.go#L13-L49) 为例）：
 
 ```
 ┌─ supportUserInvites() ──────────────────────────────┐
@@ -213,7 +213,7 @@ func fixPostSignatureCharset(db *datastore) error {
 
 #### 模式 2：闭包式事务执行器（4 个迁移：V4/V5/V7/V8）
 
-适用 OAuth 系列迁移。以 [v4/oauth()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v4.go#L20-L54) 为例：
+适用 OAuth 系列迁移。以 [v4/oauth()](migrations/v4.go#L20-L54) 为例：
 
 ```
 ┌─ oauth() ─────────────────────────────────────────────────────┐
@@ -237,7 +237,7 @@ func fixPostSignatureCharset(db *datastore) error {
 
 ### 3.2 迁移主循环的事务间隙
 
-[Migrate()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/migrations.go#L92-L133) 主循环**不包裹在全局事务中**：
+[Migrate()](migrations/migrations.go#L92-L133) 主循环**不包裹在全局事务中**：
 
 ```
 版本状态: N
@@ -260,7 +260,7 @@ INSERT appmigrations(version=N+2)  ← 独立自动提交
 
 ### 3.3 业务层事务边界
 
-以 [CreateUser()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database.go#L213-L267) 为代表的业务操作（手写模式）：
+以 [CreateUser()](database.go#L213-L267) 为代表的业务操作（手写模式）：
 
 ```
 ┌─ CreateUser() ─────────────────────────────────┐
@@ -276,15 +276,15 @@ INSERT appmigrations(version=N+2)  ← 独立自动提交
 
 ### 3.4 通用事务执行器的实际使用
 
-[db/tx.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/tx.go) 定义的 `RunTransactionWithOptions()` 实际被以下位置调用：
+[db/tx.go](db/tx.go) 定义的 `RunTransactionWithOptions()` 实际被以下位置调用：
 
 | 位置 | 用途 | 模式 |
 |------|------|------|
-| [migrations/v4.go#L25](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v4.go#L25) | OAuth 表迁移（oauth_users, oauth_client_states） | 迁移 Builder 模式 |
-| [migrations/v5.go#L25](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v5.go#L25) | Slack OAuth 字段扩充 | 迁移 Builder 模式 |
-| [migrations/v7.go#L25](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v7.go#L25) | OAuth 绑定账号字段 | 迁移 Builder 模式 |
-| [migrations/v8.go#L25](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v8.go#L25) | OAuth 邀请码字段 | 迁移 Builder 模式 |
-| [database.go#L2960](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database.go#L2960) | `ValidateOAuthState()` — 校验并消费 OAuth state | 业务场景 |
+| [migrations/v4.go#L25](migrations/v4.go#L25) | OAuth 表迁移（oauth_users, oauth_client_states） | 迁移 Builder 模式 |
+| [migrations/v5.go#L25](migrations/v5.go#L25) | Slack OAuth 字段扩充 | 迁移 Builder 模式 |
+| [migrations/v7.go#L25](migrations/v7.go#L25) | OAuth 绑定账号字段 | 迁移 Builder 模式 |
+| [migrations/v8.go#L25](migrations/v8.go#L25) | OAuth 邀请码字段 | 迁移 Builder 模式 |
+| [database.go#L2960](database.go#L2960) | `ValidateOAuthState()` — 校验并消费 OAuth state | 业务场景 |
 
 **业务层使用示例（ValidateOAuthState）**：
 ```go
@@ -316,7 +316,7 @@ err := wf_db.RunTransactionWithOptions(ctx, db.DB, &sql.TxOptions{},
 
 版本号采用**线性递增整数**，直接对应 `migrations` 数组的索引 + 1。
 
-定义在 [migrations/migrations.go#L58-L81](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/migrations.go#L58-L81)：
+定义在 [migrations/migrations.go#L58-L81](migrations/migrations.go#L58-L81)：
 
 ```go
 var migrations = []Migration{
@@ -368,7 +368,7 @@ func CurrentVer() int {
 
 ### 4.2 版本记录表 `appmigrations`
 
-结构定义在 [migrations.go#L103-L107](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/migrations.go#L103-L107)：
+结构定义在 [migrations.go#L103-L107](migrations/migrations.go#L103-L107)：
 
 | 字段 | 类型 | 含义 |
 |------|------|------|
@@ -380,7 +380,7 @@ func CurrentVer() int {
 
 ### 4.3 初始化路径（db init）
 
-[adminInitDatabase()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/app.go#L967-L1011) 流程：
+[adminInitDatabase()](app.go#L967-L1011) 流程：
 
 ```
 1. 选择 schema 文件
@@ -402,7 +402,7 @@ func CurrentVer() int {
 
 ### 4.4 增量迁移路径（db migrate）
 
-[Migrate()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/migrations.go#L92-L133) 的算法：
+[Migrate()](migrations/migrations.go#L92-L133) 的算法：
 
 ```
 1. 检查 appmigrations 表是否存在
@@ -522,17 +522,17 @@ MySQL 中 `ALTER TABLE`、`CREATE INDEX` 等 DDL 语句会**隐式提交当前�
 
 | 组件 | 定义位置 | 实际复用点 |
 |------|---------|-----------|
-| `DialectType` + `DialectMySQL/SQLite` | [db/dialect.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/dialect.go) | migrations/v4, v5, v7, v8 |
-| `CreateTableSqlBuilder`（Table/Column/UniqueConstraint） | [db/create.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/create.go) | migrations/v4 |
-| `AlterTableSqlBuilder`（AddColumn/ChangeColumn） | [db/alter.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/alter.go) | migrations/v5, v7, v8 |
-| `CreateIndexSqlBuilder`（CreateUniqueIndex） | [db/index.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/index.go) | migrations/v5 |
-| `RunTransactionWithOptions`（事务闭包） | [db/tx.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/tx.go) | migrations/v4, v5, v7, v8; business/ValidateOAuthState |
-| `RawSqlBuilder` | [db/raw.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/raw.go) | 未被任何非测试代码使用 |
-| `DropIndexSqlBuilder`（DropIndex） | [db/index.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/db/index.go) | 未被任何非测试代码使用 |
+| `DialectType` + `DialectMySQL/SQLite` | [db/dialect.go](db/dialect.go) | migrations/v4, v5, v7, v8 |
+| `CreateTableSqlBuilder`（Table/Column/UniqueConstraint） | [db/create.go](db/create.go) | migrations/v4 |
+| `AlterTableSqlBuilder`（AddColumn/ChangeColumn） | [db/alter.go](db/alter.go) | migrations/v5, v7, v8 |
+| `CreateIndexSqlBuilder`（CreateUniqueIndex） | [db/index.go](db/index.go) | migrations/v5 |
+| `RunTransactionWithOptions`（事务闭包） | [db/tx.go](db/tx.go) | migrations/v4, v5, v7, v8; business/ValidateOAuthState |
+| `RawSqlBuilder` | [db/raw.go](db/raw.go) | 未被任何非测试代码使用 |
+| `DropIndexSqlBuilder`（DropIndex） | [db/index.go](db/index.go) | 未被任何非测试代码使用 |
 
 ### 6.2 V4：首次完整采用 Builder 模式（建表场景）
 
-[migrations/v4.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v4.go) 是第一个引入 Builder 模式的迁移。
+[migrations/v4.go](migrations/v4.go) 是第一个引入 Builder 模式的迁移。
 
 **方言选择桥接**（机制 A 与机制 B 的交汇点）：
 ```go
@@ -568,7 +568,7 @@ _, err = t.Exec(`CREATE TABLE userinvites (
 
 ### 6.3 V5：最复杂的 Builder 复用场景（改表 + 索引 + 驱动分支）
 
-[migrations/v5.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v5.go) 展示了 Builder 模式的全部能力。
+[migrations/v5.go](migrations/v5.go) 展示了 Builder 模式的全部能力。
 
 **批量构建 SQL**：使用 `[]wf_db.SQLBuilder` 切片收集多个语句，统一遍历执行：
 ```go
@@ -612,8 +612,8 @@ for _, builder := range builders {
 
 V7 和 V8 是单条 ALTER TABLE 的简单场景，同样采用 Builder 模式：
 
-- [v7/oauthAttach()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v7.go#L20-L46)：为 `oauth_client_states` 增加 `attach_user_id` 列（可空 INT）
-- [v8/oauthInvites()](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/migrations/v8.go#L20-L45)：为 `oauth_client_states` 增加 `invite_code` 列（CHAR(6)，可空）
+- [v7/oauthAttach()](migrations/v7.go#L20-L46)：为 `oauth_client_states` 增加 `attach_user_id` 列（可空 INT）
+- [v8/oauthInvites()](migrations/v8.go#L20-L45)：为 `oauth_client_states` 增加 `invite_code` 列（CHAR(6)，可空）
 
 ### 6.5 复用模式的演进趋势
 
@@ -635,9 +635,9 @@ V9-V17 (2021-2026) →  回归手写模式（drivers.go + Begin/Commit）
 
 ### 6.6 业务层的复用：仅事务执行器
 
-业务代码（[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database.go)）整体上对手写 SQL 的依赖非常强，**仅复用了 `db/` 包的 `RunTransactionWithOptions` 事务执行器**。
+业务代码（[database.go](database.go)）整体上对手写 SQL 的依赖非常强，**仅复用了 `db/` 包的 `RunTransactionWithOptions` 事务执行器**。
 
-使用场景集中在 OAuth 相关的 `ValidateOAuthState()`（[database.go#L2955-L2985](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/database.go#L2955-L2985)），对应读-改-校验的原子需求。而：
+使用场景集中在 OAuth 相关的 `ValidateOAuthState()`（[database.go#L2955-L2985](database.go#L2955-L2985)），对应读-改-校验的原子需求。而：
 - 建表 / 改表场景为 0（业务层不做 DDL）
 - Builder 的 Create/Alter/Index 组件未被业务层使用
 - 业务层的方言差异仍然通过 `database.go` 内的 `now()/upsert()/clip()/dateAdd()/dateSub()` 等方法处理
@@ -666,7 +666,7 @@ V9-V17 (2021-2026) →  回归手写模式（drivers.go + Begin/Commit）
 
 ## 7. 命令行入口
 
-通过 [cmd/writefreely/db.go](file:///d:/fz/0601-1/solo-dogfeeding/code/36-writefreely/cmd/writefreely/db.go) 暴露两个子命令：
+通过 [cmd/writefreely/db.go](cmd/writefreely/db.go) 暴露两个子命令：
 
 ```bash
 writefreely db init      # 新安装：加载 schema.sql/sqlite.sql + SetInitialMigrations + Migrate
