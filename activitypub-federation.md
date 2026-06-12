@@ -234,36 +234,143 @@ type RemoteUser struct {
 | remote_user_id | INTEGER | 点赞者 ID |
 | created | DATETIME | 点赞时间 |
 
-### 3.3 Actor 查询流程
+### 3.3 找出 Actor 的多种方法
+
+WriteFreely 提供了三种查询远程用户的入口，分别通过不同的标识查找：
+
+| 方法 | 参数 | 查找字段 | 返回类型 | 文件 |
+|------|------|---------|---------|------|
+| `getRemoteUser` | actor IRI | `actor_id` | *RemoteUser | [activitypub.go:L1001-L1017](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1001-L1017) |
+| `getRemoteUserFromHandle` | @user@domain | `handle` | *RemoteUser | [activitypub.go:L1021-L1034](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1021-L1034) |
+| `getRemoteUserFromURL` | 主页 URL | `url` | *RemoteUser | [activitypub.go:L1037-L1051](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1037-L1051) |
+
+三者都是纯本地数据库查询，不涉及网络请求。若记录不存在，返回 `ErrRemoteUserNotFound` 或 `sql.ErrNoRows`。
+
+### 3.4 Actor 查询流程（getActor）
 
 函数：[getActor](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1053-L1096)
+
+`getActor` 是一个**组合函数**：先查本地缓存，查不到则远程抓取。它返回两个值：
+- `*activitystreams.Person` - 完整的 Actor 数据对象
+- `*RemoteUser` - 本地数据库记录（若存在）
+
+**详细流程**：
 
 ```
 getActor(actorIRI)
     ↓
-getRemoteUser(app, actorIRI)  // 本地查询
-    ├─ 存在 → 返回 *RemoteUser
-    └─ 不存在（404）→ 远程查询
+第一步：本地查询 getRemoteUser(actorIRI)
+    ├─ 命中 → actor = remoteUser.AsPerson()，直接返回
+    └─ 未命中 → 进入远程获取流程
         ↓
-resolveIRI(hostName, actorIRI)  // HTTP GET 带签名
+第二步：第一次 resolveIRI(actorIRI)
+    ├─ HTTP GET + 签名请求 Actor 端点
+    ├─ unmarshalActor 解析为 baseActor（基础信息）
+    └─ 失败 → 返回 500 错误
         ↓
-unmarshalActor() → 解析为 Person 对象
+第三步：第二次 resolveIRI(baseActor.PublicKey.Owner)
+    ├─ 用 publicKey.owner 字段再次请求
+    ├─ 获取完整的 Actor 信息（含完整公钥）
+    └─ 失败 → 返回 500 错误
         ↓
-再次 resolveIRI(baseActor.PublicKey.Owner)  // 获取完整 Actor
-        ↓
-返回解析后的 Person
+返回 (fullActorPerson, nil, nil)
 ```
 
-### 3.4 远程用户添加
+> **为什么要两次请求？** 某些 ActivityPub 实现（如 Mastodon）首次返回的 Actor 可能不包含完整公钥，需要通过 `publicKey.owner` 指向的真实 Actor 端点再次获取。这是为了兼容多种联邦实例的差异。
 
-函数：[apAddRemoteUser](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/database_activitypub.go#L21-L50)
+**只读性质**：`getActor` **本身不落库**，它只负责"获取数据"。是否持久化由调用方决定。
 
-**事务流程**：
-1. 插入 `remoteusers` 表，获取自增 ID
-2. 插入 `remoteuserkeys` 表存储公钥
-3. 任何步骤失败则 Rollback
+### 3.5 远程用户记录的完善与更新
 
-### 3.5 本地 Actor 构造
+`remoteusers` 表的记录可能处于不完整状态（历史版本遗留、部分字段缺失等）。系统在多个时机尝试补全记录：
+
+#### 3.5.1 Handle 补全
+
+场景：通过 actor_id 能查到记录，但 `handle` 字段为空（老版本数据）。
+
+触发位置：[GetProfileURLFromHandle](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1117-L1124)
+
+```go
+remoteUser, err := getRemoteUserFromHandle(app, handle)
+if err != nil {
+    actorIRI = RemoteLookup(handle)              // WebFinger 查得 actor IRI
+    _, errRemoteUser := getRemoteUser(app, actorIRI)
+    if errRemoteUser == nil {
+        // 记录存在但 handle 为空 → 更新 handle
+        app.db.Exec("UPDATE remoteusers SET handle = ? WHERE actor_id = ?", handle, actorIRI)
+    }
+}
+```
+
+#### 3.5.2 URL 补全
+
+场景：记录存在但 `url`（个人主页 URL）字段为空。
+
+触发位置：[GetProfileURLFromHandle](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1142-L1154)
+
+```go
+if remoteUser.URL == "" {
+    newRemoteActor, err := activityserve.NewRemoteActor(remoteUser.ActorID)
+    if err == nil {
+        app.db.Exec("UPDATE remoteusers SET url = ? WHERE actor_id = ?",
+            newRemoteActor.URL(), remoteUser.ActorID)
+    }
+}
+```
+
+#### 3.5.3 新建完整记录
+
+当本地完全没有该用户记录时，使用 `activityserve.NewRemoteActor()` 拉取完整信息后插入：
+
+**方式一**：通过 handle 查找时（完整字段）[activitypub.go:L1126-L1140](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1126-L1140)
+```sql
+INSERT INTO remoteusers (actor_id, inbox, shared_inbox, url, handle) VALUES(?, ?, ?, ?, ?)
+```
+
+**方式二**：关注/点赞时（通过 `apAddRemoteUser`，含公钥）[database_activitypub.go:L23-L37](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/database_activitypub.go#L23-L37)
+```sql
+INSERT INTO remoteusers (actor_id, inbox, shared_inbox, url) VALUES (?, ?, ?, ?)
+INSERT INTO remoteuserkeys (id, remote_user_id, public_key) VALUES (?, ?, ?)
+```
+
+> **注意**：两种插入方式字段不完全一致。`apAddRemoteUser` 会同时插入公钥（`remoteuserkeys` 表），而 `GetProfileURLFromHandle` 路径只插入 `remoteusers`。
+
+### 3.6 查询 Actor 时：只读 vs 落库的区别
+
+这是一个关键的设计区别：**`getActor` 只是读取，落库发生在实际需要建立关系时**。
+
+#### 3.6.1 仅读取（不落库）的场景
+
+`getActor` 本身永远不落库。调用它但不触发写入的情况：
+
+- **Follow 回调中的预获取**：`FollowCallback` 调用 `getActor` 仅为了获取 inbox 地址和公钥信息，用于后续构建 Accept 活动。此时**不落库**。
+- **Like 回调中的预获取**：`LikeCallback` 调用 `getActor` 同理，仅为了获取用户信息用于校验，此时**不落库**。
+
+#### 3.6.2 需要落库的场景
+
+落库是由**业务动作**触发的，发生在 `getActor` 调用之后：
+
+| 场景 | 落库函数 | 时机 | 位置 |
+|------|---------|------|------|
+| 点赞 | `apAddRemoteUser` | 同步处理 Like 时，插入点赞记录前 | [activitypub.go:L570-L575](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L570-L575) |
+| 关注 | 直接 SQL INSERT | 异步 goroutine 中，插入关注关系前 | [activitypub.go:L673-L703](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L673-L703) |
+
+**点赞流程中的落库逻辑**：
+```go
+if remoteUser != nil {
+    remoteUserID = remoteUser.ID     // 本地有记录，直接用 ID
+} else {
+    remoteUserID, err = apAddRemoteUser(app, t, fullActor)  // 没记录，先落库
+}
+// 然后才插入 remote_likes
+```
+
+**设计思路**：
+- `getActor` 保持纯粹的"获取"语义，单一职责
+- 落库与业务绑定（点赞需要用户 ID 作为外键，关注也一样）
+- 避免"为了缓存而缓存"，只在真正需要时才写入数据库
+
+### 3.7 本地 Actor 构造
 
 函数：[PersonObject](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/collections.go#L330-L359)
 
