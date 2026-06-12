@@ -280,14 +280,162 @@ func (db *datastore) RecordRemoteUserID(ctx context.Context, localUserID int64, 
 }
 ```
 
-**`oauth_users` 表结构：**
-- `user_id`: 本地用户 ID
-- `remote_user_id`: OAuth Provider 返回的用户唯一标识
-- `provider`: Provider 名称
-- `client_id`: OAuth 应用 Client ID
-- `access_token`: OAuth Access Token
+**`oauth_users` 表结构（由 [V4](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/migrations/v4.go#L20-L53) + [V5](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/migrations/v5.go#L20-L87) 迁移定义）：**
+- `user_id`: 本地用户 ID（INTEGER）
+- `remote_user_id`: OAuth Provider 返回的用户唯一标识（VARCHAR(128)，V4 初始为 INTEGER，V5 改为 VARCHAR）
+- `provider`: Provider 名称（VARCHAR(24)，V5 新增）
+- `client_id`: OAuth 应用 Client ID（VARCHAR(128)，V5 新增）
+- `access_token`: OAuth Access Token（TEXT，V11 从 VARCHAR(512) 扩宽）
 
-注意 MySQL 的 upsert 语句 `db.upsert("user")` 存在潜在问题——它使用 `ON DUPLICATE KEY UPDATE`，但需要唯一索引是 `(user_id, remote_user_id, provider, client_id)` 的组合，否则重复绑定可能失败。
+**数据库唯一索引约束（V5 迁移建立）：**
+在 [v5.go:62](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/migrations/v5.go#L62) 创建了唯一索引：
+
+```go
+dialect.CreateUniqueIndex("oauth_users_uk", "oauth_users", "user_id", "provider", "client_id")
+```
+
+生成的 SQL 为：
+```sql
+CREATE UNIQUE INDEX oauth_users_uk ON oauth_users (user_id, provider, client_id)
+```
+
+⚠️ **关键发现：唯一索引不包含 `remote_user_id`**
+
+这意味着：
+- **一个本地用户** + **一个 provider** + **一个 client_id** → 只能有 **一条** 绑定记录（正确，防止同一本地用户重复绑定同一 Provider 同一应用）
+- 但数据库层面 **不保证** 同一个 `remote_user_id` 只能绑定到一个本地用户——这完全依赖应用层逻辑（[viewOauthCallback](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth.go#L355-L366) 中的检查）
+
+**Upsert 行为分析：**
+
+[upsert](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/database.go#L174-L182) 函数定义：
+```go
+func (db *datastore) upsert(indexedCols ...string) string {
+    if db.driverName == driverSQLite {
+        cc := strings.Join(indexedCols, ", ")
+        return "ON CONFLICT(" + cc + ") DO UPDATE SET"
+    }
+    return "ON DUPLICATE KEY UPDATE"
+}
+```
+
+- **SQLite 分支**：使用 `INSERT OR REPLACE`，由 `INSERT OR REPLACE` 的语义决定（遇到任何 UNIQUE 约束冲突即替换整行）
+- **MySQL 分支**：调用 `db.upsert("user")` 传入 `"user"`，生成 `ON DUPLICATE KEY UPDATE`——注意 `"user"` 参数在 MySQL 分支中 **完全未使用**！MySQL 的 `ON DUPLICATE KEY UPDATE` 会检测任意唯一索引冲突，而不仅限于某列
+
+### 3.5 邀请码在注册确认页的回传与签名覆盖分析
+
+#### 3.5.1 邀请码的传递链路
+
+邀请码的完整流转路径：
+
+```
+用户带 invite_code 访问登录入口 /oauth/gitlab?invite_code=ABC123
+    ↓
+viewOauthInit() 取 r.FormValue("invite_code")
+    ↓
+GenerateOAuthState(..., invite_code="ABC123")  → 存入 oauth_client_states.invite_code
+    ↓ (用户授权后回调)
+viewOauthCallback()
+  ├─ ValidateOAuthState() → 从 state 中恢复出 inviteCode
+  ├─ 校验邀请码有效性（GetUserInvite + i.Active）
+  ├─ 构造 oauthSignupPageParams{ InviteCode: "ABC123" }
+  └─ showOauthSignupPage() 渲染模板
+    ↓
+signup-oauth.tmpl 渲染隐藏字段
+  {{if .InviteCode}}<input type="hidden" name="invite_code" value="{{ .InviteCode }}" />{{end}}
+    ↓ (用户提交表单 POST /oauth/signup)
+viewOauthSignup() 读取 r.FormValue("invite_code")
+  ├─ 签名校验（但 InviteCode 不在签名范围内 → 见下文）
+  └─ 调用 CreateInvitedUser(tp.InviteCode, newUser.ID) 记录使用
+```
+
+#### 3.5.2 签名覆盖范围的精确分析
+
+[HashTokenParams](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth_signup.go#L77-L88) 的实现：
+
+```go
+type oauthSignupPageParams struct {
+    AccessToken     string   // ✅ 参与签名
+    TokenUsername   string   // ✅ 参与签名
+    TokenAlias      string   // ✅ 参与签名
+    TokenEmail      string   // ✅ 参与签名
+    TokenRemoteUser string   // ✅ 参与签名
+    ClientID        string   // ✅ 参与签名
+    Provider        string   // ✅ 参与签名
+    TokenHash       string   // ❌ 签名结果本身
+    InviteCode      string   // ❌ 未参与签名 —— 关键漏洞
+}
+
+func (p oauthSignupPageParams) HashTokenParams(key string) string {
+    hasher := sha256.New()
+    hasher.Write([]byte(key))                // HashSeed
+    hasher.Write([]byte(p.AccessToken))      // 写入
+    hasher.Write([]byte(p.TokenUsername))    // 写入
+    hasher.Write([]byte(p.TokenAlias))       // 写入
+    hasher.Write([]byte(p.TokenEmail))       // 写入
+    hasher.Write([]byte(p.TokenRemoteUser))  // 写入
+    hasher.Write([]byte(p.ClientID))         // 写入
+    hasher.Write([]byte(p.Provider))         // 写入
+    // ⚠️  hasher.Write([]byte(p.InviteCode))  —— 缺失！
+    return hex.EncodeToString(hasher.Sum(nil))
+}
+```
+
+**签名覆盖字段清单：**
+
+| 字段 | 参与签名 | 表单回传 | 篡改风险 |
+|------|---------|---------|---------|
+| AccessToken | ✅ 是 | ✅ `<input type="hidden" name="access_token">` | 被签名保护 |
+| TokenUsername | ✅ 是 | ✅ `token_username` | 被签名保护 |
+| TokenAlias | ✅ 是 | ✅ `token_alias` | 被签名保护 |
+| TokenEmail | ✅ 是 | ✅ `token_email` | 被签名保护 |
+| TokenRemoteUser | ✅ 是 | ✅ `token_remote_user` | 被签名保护 |
+| ClientID | ✅ 是 | ✅ `client_id` | 被签名保护 |
+| Provider | ✅ 是 | ✅ `provider` | 被签名保护 |
+| **InviteCode** | **❌ 否** | ✅ `invite_code`（条件渲染） | **可被篡改** |
+| username（用户输入） | ❌ 否 | ✅ 用户填写 | 设计上允许修改 |
+| alias（显示名） | ❌ 否 | ✅ 用户填写 | 设计上允许修改 |
+| email（邮箱） | ❌ 否 | ✅ 用户填写 | 设计上允许修改 |
+| password（密码） | ❌ 否 | ✅ 用户填写 | 设计上允许修改 |
+
+#### 3.5.3 邀请码篡改的具体影响
+
+由于 `InviteCode` **不在签名计算范围内**，攻击者可以：
+
+**攻击场景（1）—— 移除邀请码绕过邀请制限制：**
+
+1. 管理员开启邀请码注册（`open_registration = false`），攻击者通过某个 OAuth 链接获取了合法邀请码 `INVITE_VALID`
+2. 到达注册确认页后，攻击者通过浏览器 DevTools **删除** 表单中 `<input type="hidden" name="invite_code" value="INVITE_VALID">`
+3. 提交时：
+   - `viewOauthSignup` 重新计算签名 → `InviteCode=""`，但签名是用 `InviteCode="INVITE_VALID"` 生成的？
+   - **不，等等**：`viewOauthSignup` 从表单读取 `InviteCode`（现在为空），然后用**当前**的参数（包括空邀请码）计算签名
+   - 但表单中的 `signature` 值是回调时生成的，当时 `InviteCode="INVITE_VALID"`
+
+   **关键问题反转了**：由于签名 **不包含** `InviteCode`，不管 `InviteCode` 是 `INVITE_VALID` 还是空串，计算出的哈希值 **完全相同**！
+
+4. 所以攻击可行：
+   - 移除邀请码 → `tp.InviteCode = ""`
+   - 重新计算哈希：由于 `InviteCode` 不写入 hasher，哈希值与原始签名 **匹配**
+   - 签名校验通过！
+   - `CreateInvitedUser` 因 `tp.InviteCode == ""` 跳过
+   - **结果**：在 `open_registration = false` 的邀请码注册模式下，攻击者无需有效邀请码即可注册账号
+
+**攻击场景（2）—— 替换他人邀请码：**
+
+攻击者可以将邀请码替换为任意已知邀请码（例如一个还未使用的高价邀请码），以此消耗他人的邀请配额，因为签名不会检测到邀请码的改变。
+
+**攻击场景（3）—— 在回调阶段之后篡改：**
+
+即使 `viewOauthCallback` 中对邀请码做了有效性校验（[oauth.go:393-401](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth.go#L393-L401)），但该检查仅发生在回调入口。从回调返回到用户提交注册表单之间可能间隔数小时/数天，期间：
+- 邀请码可能已被使用/过期
+- 但因为表单中的邀请码 **可以被自由替换为另一个有效邀请码**（签名不检测），所以攻击者可以等待某个邀请码失效后，将其换为新获取的邀请码，而无需重新走 OAuth 流程
+
+#### 3.5.4 其他字段可被篡改的影响
+
+用户名、显示名、邮箱是设计上允许用户修改的，不在签名保护范围内是正确的。但需注意：
+
+- `password` 字段同样在签名外，但 OAuth 注册流程中密码是可选的（用户可选择不设置密码，后续仅通过 OAuth 登录）
+- 如果管理员开启了 `disable_password_auth = true`，密码字段无意义
+- 但如果没有开启，攻击者理论上可以通过篡改表单给自己设置密码，获得密码登录能力（即便 OAuth 解绑也能登录）
 
 ---
 
