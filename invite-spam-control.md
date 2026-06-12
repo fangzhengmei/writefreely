@@ -86,7 +86,71 @@ func handleCreateUserInvite(app *App, u *User, w http.ResponseWriter, r *http.Re
 创建邀请前的风控检查：
 - **静默状态检查**：调用 `u.IsSilenced()`，被静默用户无法创建邀请
 
-### 2.4 邀请码使用（注册流程关联）
+### 2.5 深度分析：Inactive 字段的设计与未实现问题
+
+#### 2.5.1 字段现状
+
+`Inactive` 字段定义在 [invites.go#L32](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/invites.go#L32)：
+```go
+type Invite struct {
+    // ...
+    Inactive bool  // 字段存在，但未被有效性判断使用
+}
+```
+
+数据库层面完整支持：
+- 表定义：[schema.sql#L213](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/schema.sql#L213) `inactive tinyint(1) NOT NULL`
+- 创建时默认 0：[database.go#L2738](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/database.go#L2738) `... VALUES (..., 0)`
+- 查询时读取：[database.go#L2753](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/database.go#L2753)、[database.go#L2761](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/database.go#L2761)
+
+**但核心问题**：[Active() 方法](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/invites.go#L45-L55) 中完全没有检查 `i.Inactive`：
+
+```go
+func (i Invite) Active(db *datastore) bool {
+    if i.Expired() {          // 只检查过期
+        return false
+    }
+    if i.MaxUses.Valid && i.MaxUses.Int64 > 0 {  // 只检查使用次数
+        if c := db.GetUsersInvitedCount(i.ID); c >= i.MaxUses.Int64 {
+            return false
+        }
+    }
+    // 缺少：if i.Inactive { return false }
+    return true  // 即使 Inactive=true，也会返回 true！
+}
+```
+
+#### 2.5.2 设计意图推测
+
+`Inactive` 字段的设计目标应该是**手动停用机制**：
+- `Expires` 是**自动时间维度**的失效
+- `MaxUses` 是**自动数量维度**的失效
+- `Inactive` 是**管理员手动维度**的失效
+
+典型使用场景：
+1. 发现某个邀请码被滥用（如在公开论坛泄露）
+2. 某用户行为可疑，需要立即冻结其发出的所有邀请
+3. 活动结束后批量停用一批邀请码
+
+#### 2.5.3 未实现的原因与权衡
+
+这是一个**典型的"预留但未落地"的功能**，可能的原因包括：
+
+| 可能性 | 分析 |
+|--------|------|
+| **功能优先级** | 时间/次数限制已覆盖 90% 以上场景，手动停用属于低频高级功能 |
+| **UI 未就绪** | 管理员后台缺少"停用邀请码"的操作入口 |
+| **迭代中暂停** | 开发到一半发现需要配套的审计日志、恢复机制，暂时搁置 |
+| **代码遗留** | 早期设计考虑更复杂，但实际使用中发现不需要 |
+
+**当前状态的风险**：
+1. 数据一致性风险：字段存在但不生效，未来如果添加检查逻辑，已有的 `inactive=1` 数据会突然生效
+2. 维护成本：开发者看到字段会误以为它在工作，增加理解成本
+3. 潜在 BUG：如果有人在不知情的情况下把某邀请码 `inactive` 设为 1，但它仍然可以被使用
+
+---
+
+## 2.6 邀请码使用（注册流程关联）
 
 在 [account.go#L178-L184](file:///d:/fz/0601-1/solo-dogfeeding/code/38-writefreely/account.go#L178-L184) 中，用户注册成功后记录邀请关系：
 
