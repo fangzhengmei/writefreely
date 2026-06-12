@@ -634,42 +634,56 @@ LEFT JOIN users u ON u.id = p.owner_id         -- 关联用户表检查状态
 
 #### Reader 页面的作者过滤
 
-**代码位置:** [read.go L185-L224](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L185-L224)
+**路由注册:** [routes.go L242-L251](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/routes.go#L242-L251)
+```go
+func RouteRead(handler *Handler, readPerm UserLevelFunc, r *mux.Router) {
+    // ...
+    r.HandleFunc("/{author}", handler.Web(viewLocalTimeline, readPerm))  // /read/{author}
+    r.HandleFunc("/", handler.Web(viewLocalTimeline, readPerm))
+}
+```
+
+**参数传递链路:**
+1. `RouteRead` 注册路由时，`/{author}` 路径变量由 gorilla/mux 捕获
+2. `viewLocalTimeline` 读取 `mux.Vars(r)["author"]` 并传给 `showLocalTimeline`
+   ```go
+   // read.go L151, L159
+   vars := mux.Vars(r)
+   return showLocalTimeline(app, w, r, page, vars["author"], vars["tag"])
+   ```
+   **代码位置:** [read.go L151-L159](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L151-L159)
+
+**实际过滤逻辑:** [read.go L202-L213](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L202-L213)
 
 ```go
-func showLocalTimeline(app *App, ..., page int, author, tag string) error {
-    // ...
-    if author != "" {
-        posts = []PublicPost{}
-        for _, p := range *app.timeline.posts {
-            if author == "anonymous" {
-                // 筛选 "匿名" → p.Collection == nil 的文章
-                // 注意: 由于 SQL 从 collections 出发，实际不会有 p.Collection == nil 的文章
-                if p.Collection == nil {
-                    posts = append(posts, p)
-                }
-            } else if p.Collection != nil && p.Collection.Alias == author {
-                // 按 Collection 别名（即用户名）筛选
+var posts []PublicPost
+if author != "" {
+    posts = []PublicPost{}
+    for _, p := range *app.timeline.posts {
+        if author == "anonymous" {
+            if p.Collection == nil {
                 posts = append(posts, p)
             }
+        } else if p.Collection != nil && p.Collection.Alias == author {
+            // 关键：使用 p.Collection.Alias 字段进行精确匹配
+            posts = append(posts, p)
         }
     }
 }
 ```
 
-**路由中的 author 参数来源:** [routes.go L249](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/routes.go#L249-L249)
-```go
-r.HandleFunc("/{author}", handler.Web(viewLocalTimeline, readPerm))  // /read/{author}
-```
+> **精确匹配字段：** `/read/{author}` 接口实际是根据 **`p.Collection.Alias`**（即 Collection 的 URL 别名字段）进行过滤，而不是用户名、用户 ID 或 Collection 标题。
+>
+> 由于 Collection.Alias 在用户注册时默认设为与用户名相同的值，所以通常看起来像是按用户名筛选，但本质上比较的是 Collection 的 alias 字段。
 
-#### 按作者过滤的三种形式
+#### 按作者过滤的四种形式
 
-| URL 模式 | 筛选条件 | 说明 |
-|---------|---------|------|
-| `/read/` | 无过滤 | 所有公开文章聚合 |
-| `/read/{author}` | `p.Collection.Alias == author` | 只显示指定 Collection（用户名）的文章 |
-| `/read/anonymous` | `p.Collection == nil` | 理论上筛选匿名文章，但实际结果为空（因 SQL JOIN 排除） |
-| `/read/t/{tag}` | 按标签内容筛选 | 文章内容包含指定 #标签 |
+| URL 模式 | 匹配的过滤条件 | 实际比较字段 | 说明 |
+|---------|--------------|------------|------|
+| `/read/` | 无过滤 | —— | 所有公开文章聚合，支持分页 |
+| `/read/{author}` | `p.Collection.Alias == author` | `collections.alias` | 只显示 Collection alias 精确匹配的文章 |
+| `/read/anonymous` | `p.Collection == nil` | `posts.collection_id IS NULL` | 理论筛选匿名文章，实际结果为空 |
+| `/read/t/{tag}` | `p.HasTag(tag)` | 文章内容中的 `#标签` | 按 Markdown 内容中的标签筛选 |
 
 ---
 
@@ -1028,17 +1042,68 @@ func collectionAliasFromReq(r *http.Request) string {
 }
 ```
 
-#### 解析优先级
+> **重要修正：** 虽然代码逻辑上优先尝试 `subdomain`，但**在现有代码配置中，`subdomain` 变量实际上永远为空**，总是回退到 `collection` 路径参数。详情见下文。
 
-1. **第一优先级: 子域名 (`subdomain`)**
-   - 来源: `mux.Vars(r)["subdomain"]`
-   - 例如: `alice.example.com` → `alice`
+---
 
-2. **第二优先级: URL 路径 (`collection`)**
-   - 来源: `mux.Vars(r)["collection"]`
-   - 例如: `example.com/alice/feed/` → `alice`
+#### `subdomain` 变量在现有代码中的实际入口分析
 
-#### 路由层面的参数配置
+##### 理论上的 `subdomain` 捕获方式
+
+在 gorilla/mux 框架中，`subdomain` 变量通常通过 `Host()` 路由模式捕获：
+```go
+// 理论上的配置方式（现有代码中不存在）
+r.Host("{subdomain}.example.com").Path("/feed/").HandlerFunc(...)
+```
+这种配置下，访问 `alice.example.com/feed/` 时，`vars["subdomain"]` 会被设置为 `"alice"`。
+
+##### 现有代码中的路由配置
+
+**实际路由配置:** [routes.go L38-L59](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/routes.go#L38-L59)
+
+```go
+func InitRoutes(apper Apper, r *mux.Router) *mux.Router {
+    // hostSubroute 仅用于日志输出，未实际用于 Host() 路由匹配
+    hostSubroute := apper.App().cfg.App.Host[strings.Index(apper.App().cfg.App.Host, "://")+3:]
+    if apper.App().cfg.App.SingleUser {
+        hostSubroute = "{domain}"
+    }
+    
+    // 所有路由都通过 PathPrefix("/") 创建，不涉及 Host 匹配
+    write := r.PathPrefix("/").Subrouter()
+    // ...
+}
+```
+
+**关键点分析：**
+1. `hostSubroute` 变量在代码中被计算，但**从未实际传递给 `r.Host()` 或 `r.HostPrefix()` 方法**
+2. 所有动态路由都通过 `r.PathPrefix("/").Subrouter()` 创建，这是一个**纯路径路由**，不捕获子域名
+3. 因此，`vars["subdomain"]` 永远不会被 gorilla/mux 框架填充，始终为空字符串
+
+##### `subdomain` 变量的实际状态
+
+| 场景 | `vars["subdomain"]` 值 | 说明 |
+|------|----------------------|------|
+| `alice.example.com/feed/` | `""`（空字符串） | 现有路由不配置 Host 匹配，子域名无法捕获 |
+| `example.com/alice/feed/` | `""`（空字符串） | 路径路由不涉及 subdomain 变量 |
+| 任何其他 URL | `""`（空字符串） | 现有代码中 subdomain 变量始终为空 |
+
+**实际执行流程:**
+```go
+// collectionAliasFromReq 实际执行效果
+vars := mux.Vars(r)
+alias := vars["subdomain"]  // → 永远是 ""
+if alias == "" {
+    alias = vars["collection"]  // → 总是执行这一行
+}
+return alias
+```
+
+---
+
+#### 第二优先级（实际唯一使用）: URL 路径 `collection`
+
+**来源:** `mux.Vars(r)["collection"]`
 
 **多用户模式下的 Collection 路由前缀:** [routes.go L211-L213](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/routes.go#L211-L213)
 
@@ -1050,19 +1115,21 @@ RouteCollections(handler, write.PathPrefix("/{prefix:[@~$!\\-+]?}{collection}").
 
 **路径参数匹配规则:**
 - `{prefix:[@~$!\\-+]}`: 可选前缀字符（`@`, `~`, `$`, `!`, `-`, `+`）
-- `{collection}`: 匹配 Collection alias
+- `{collection}`: 匹配 Collection alias，这是实际获取 alias 的唯一途径
 
-**支持的 URL 形式:**
-| URL 形式 | 提取的 alias | 说明 |
-|---------|-------------|------|
-| `/alice/feed/` | `alice` | 无前缀 |
-| `/@alice/feed/` | `alice` | `@` 前缀 |
-| `/~alice/feed/` | `alice` | `~` 前缀 |
-| `alice.example.com/feed/` | `alice` | 子域名方式 |
+**实际支持的 URL 形式（当前代码）:**
+| URL 形式 | 提取的 alias | `vars["collection"]` 值 | 说明 |
+|---------|-------------|------------------------|------|
+| `/alice/feed/` | `alice` | `alice` | 无前缀 |
+| `/@alice/feed/` | `alice` | `alice` | `@` 前缀被 `prefix` 捕获 |
+| `/~alice/feed/` | `alice` | `alice` | `~` 前缀被 `prefix` 捕获 |
+| `alice.example.com/feed/` | (路由不匹配，返回 404) | N/A | 现有代码不支持子域名路由 |
 
-#### 子域名方式的数据库查询
+---
 
-当 alias 通过子域名方式获取后，最终会调用 `GetCollection(alias)`：
+#### 数据库查询
+
+无论通过何种方式获取 alias（实际只有路径方式），最终都会调用 `GetCollection(alias)`：
 ```go
 // feed.go L33
 c, err = app.db.GetCollection(alias)
@@ -1079,7 +1146,7 @@ c, err = app.db.GetCollection(alias)
 if app.cfg.App.SingleUser {
     c, err = app.db.GetCollectionByID(1)  // 固定取 ID=1 的 Collection
 } else {
-    c, err = app.db.GetCollection(alias)  // 用解析的 alias 查询
+    c, err = app.db.GetCollection(alias)  // 用路径解析的 alias 查询
 }
 ```
 
@@ -1089,25 +1156,38 @@ if app.cfg.App.SingleUser {
 HTTP 请求
     │
     ▼
-┌──────────────────────────┐
-│ collectionAliasFromReq() │
-│ 1. vars["subdomain"]?    │  → 子域名方式（如 alice.example.com）
-│ 2. vars["collection"]?   │  → 路径方式（如 /alice/feed/）
-└──────────────────────────┘
+┌──────────────────────────────────────┐
+│ collectionAliasFromReq()             │
+│ 1. vars["subdomain"]                  │  → 永远为空（现有路由不捕获）
+│ 2. vars["collection"]                 │  → 实际唯一来源
+└──────────────────────────────────────┘
     │
     ▼
-┌──────────────────────┐
-│ feed.go ViewFeed()   │
-│ 单用户? ──┐          │
-│   │       │          │
-│   ▼       ▼          │
-│ GetCollectionByID(1) │  → 固定 ID=1
-│ GetCollection(alias) │  → WHERE alias = ?
-└──────────────────────┘
+┌──────────────────────────────────────┐
+│ feed.go ViewFeed()                   │
+│ 单用户? ──┐                          │
+│   │       │                          │
+│   ▼       ▼                          │
+│ GetCollectionByID(1)                 │  → 固定 ID=1
+│ GetCollection(alias_from_path)       │  → WHERE alias = ?
+└──────────────────────────────────────┘
     │
     ▼
 SELECT * FROM collections WHERE ...
 ```
+
+---
+
+#### 关于子域名支持的补充说明
+
+代码中存在子域名相关的逻辑（`GetCollectionFromDomain`、`vars["subdomain"]` 等），表明系统**设计上支持子域名**，但在当前开源版本的路由配置中：
+- 没有使用 `r.Host("{subdomain}.domain.com")` 来捕获子域名
+- `hostSubroute` 变量计算后仅用于日志输出，未实际配置路由
+- 如需启用子域名支持，需要在 `InitRoutes` 函数中添加 `Host()` 路由匹配逻辑
+
+**相关但未实际使用的代码:**
+- `GetCollectionFromDomain(host)` - [database.go L912-L914](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/database.go#L912-L914)
+- `sitemap.go` 中的 `isSubdomain` 判断 - 同样永远为 `false`
 
 ### 10.5 字段使用位置对照表
 
