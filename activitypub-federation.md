@@ -925,6 +925,213 @@ if silenced {
 
 ---
 
+### 4.8 Inbox 错误分流全景图
+
+`handleFetchCollectionInbox` 不是简单的「出错就 200」或「出错就 500」两分法。真正要分成 **4 个阶段** 看：**Resolver 前预检**、**Resolver/回调阶段**、**Deserialize 之后的同步收尾**、**goroutine 里的异步收尾**。只有把这 4 段拆开，才能准确回答哪些路径会返回非 200、哪些会被吞成 200。
+
+#### 4.8.1 真正会返回非 200 的路径
+
+**A. Resolver 前预检阶段（4 条）**
+
+这 4 条路径发生在 `res.Deserialize(m)` 之前，HTTP 响应还没写出，返回的 error 会经过 `handler.All()` → `handleError()` → `handleHTTPError()` 渲染为真实状态码：
+
+| # | 代码行 | 触发条件 | 返回的错误 | 最终 HTTP 状态码 |
+|---|--------|---------|-----------|----------------|
+| 1 | L329-L331 | `GetCollection(alias)` 失败 | 数据库原始错误 | 500 |
+| 2 | L334-L336 | `IsUserSilenced()` 查询失败 | `ErrInternalGeneral` | 500 |
+| 3 | L338-L339 | 博客所有者被封禁 | `ErrCollectionNotFound` | 404 |
+| 4 | L361-L364 | JSON 解码失败 | 解码原始错误 | 500 |
+
+**B. Deserialize 之后的同步事务阶段（Like / Unlike 仍可能返回非 200）**
+
+这里是前几轮最容易漏掉的核心点：`res.Deserialize(m)` 成功之后，`handleFetchCollectionInbox` **并没有立刻结束**。`Like` / `Undo:Like` 还会继续执行同步事务，这些 error 不会走「吞成 200」那条分支，而是会直接 return，最终仍然变成 500。
+
+| # | 分支 | 代码行 | 触发条件 | 最终 HTTP 状态码 |
+|---|------|--------|---------|----------------|
+| 5 | Like | L563-L567 | `app.db.Begin()` 失败 | 500 |
+| 6 | Like | L578-L586 | `INSERT remote_likes` 失败（含重复键） | 500 |
+| 7 | Like | L589-L593 | `Commit()` 失败 | 500 |
+| 8 | Undo:Like | L604-L608 | `app.db.Begin()` 失败 | 500 |
+| 9 | Undo:Like | L619-L623 | `DELETE remote_likes` 失败 | 500 |
+| 10 | Undo:Like | L626-L630 | `Commit()` 失败 | 500 |
+
+**更隐蔽的一层：`apAddRemoteUser` 错误会被覆盖**
+
+在 Like / Undo:Like 路径里，如果 `remoteUser == nil`，代码会先执行：
+
+```go
+remoteUserID, err = apAddRemoteUser(app, t, fullActor)
+```
+
+但后面**没有立即检查 `err`**，而是继续执行 `t.Exec(...)`。而 `apAddRemoteUser` 自己一旦失败，已经先 `t.Rollback()` 了。于是后续 `t.Exec(...)` 往往只会报出「transaction has already been committed or rolled back」之类的次生错误，真正的根因（插 remoteusers / remoteuserkeys 失败）被覆盖掉。这仍然会返回 500，但**返回的是被污染后的错误信息**，不是最初失败点。
+
+#### 4.8.2 会被吞成 200 OK 的路径
+
+真正被统一吞成 200 的，是 **Resolver 回调本身返回的 error**，以及 `Deserialize` 遇到未知活动类型时返回的 error：
+
+```go
+if err := res.Deserialize(m); err != nil {
+    log.Error("Unable to resolve Activity: %v", err)
+    impart.RenderActivityJSON(w, "", http.StatusOK)
+    return nil
+}
+```
+
+| # | 回调 | 代码行 | 触发条件 | 错误内容 |
+|---|------|--------|---------|---------|
+| 1 | Like | L394-L395 | Like 没有第 0 个 object | `"no object for Like activity at index 0"` |
+| 2 | Like | L408-L409 | Like 的 ObjectIRI 为空 | `"didn't get ObjectIRI to Like"` |
+| 3 | Like | L411-L413 | 文章 ID 解析失败 | `parsePostIDFromURL` 的错误 |
+| 4 | Like | L418-L419 | Like 没有 actor | `"No valid actor string"` |
+| 5 | Like | L421-L423 | `getActor` 失败 | 404 转远程抓取失败后的 500，或数据库/网络错误 |
+| 6 | Follow | L467-L468 | Follow 的 actor 为空 | `"No valid 'to' string"` |
+| 7 | Follow | L470-L472 | `getActor` 失败 | 500 或数据库/网络错误 |
+| 8 | Undo→Like | L493-L494 | Unlike 没有 ObjectIRI | `"didn't get ObjectIRI for Undo Like"` |
+| 9 | Undo→Like | L496-L498 | 文章 ID 解析失败 | `parsePostIDFromURL` 的错误 |
+| 10 | Undo→Like | L500-L502 | `getActor` 失败 | 500 或数据库/网络错误 |
+| 11 | Undo→Follow | L522-L529 | `getRemoteUser` 本地查找失败 | 404 或其他错误 |
+| 12 | Deserialize | L549-L558 | 未知活动类型 / 无对应回调 | `Deserialize` 自身错误 |
+
+**准确的边界不是「`Deserialize` 前后」**，而是：
+
+- **回调返回给 `Deserialize` 的 error** → 被吞成 200
+- **`Deserialize` 之后同步事务里的 error** → 仍然返回非 200
+
+也就是说，之前把「第 549 行之前是非 200、第 549 行之后都是 200」当成规律是不准确的。真正的分界点是 **错误发生在回调里，还是发生在回调结束后的同步事务里**。
+
+#### 4.8.3 已经固定成 200、只剩日志的路径
+
+还有第三类经常和「吞成 200」混在一起，但本质不同：**响应已经先写出 200，后面的失败只会留在日志里**。
+
+这类路径主要在 Follow / Undo:Follow 的 goroutine 中：
+
+| 分支 | 代码行 | 失败点 | 对 HTTP 状态码的影响 |
+|------|--------|--------|-------------------|
+| Follow | L647-L658 | `a.Serialize()` / `makeActivityPost()` 失败 | 无影响，200 已在回调里写出 |
+| Follow | L662-L719 | 写 `remoteusers` / `remoteuserkeys` / `remotefollows` 失败 | 无影响，只记日志 |
+| Undo:Follow | L722-L727 | `DELETE remotefollows` 失败 | 无影响，只记日志 |
+
+这类错误不是「被 `Deserialize` 吞掉」，而是**HTTP 响应已经结束，根本没有机会再改状态码**。
+
+#### 4.8.4 错误流向的完整调用链
+
+```
+handleFetchCollectionInbox
+    │
+    ├─ 预检失败（GetCollection / silenced / JSON decode）
+    │    └─ return error → handler.All() / handleHTTPError() → 404 或 500
+    │
+    ├─ res.Deserialize(m)
+    │    ├─ 回调返回 error
+    │    │    └─ L549-L558 吞成 200 OK
+    │    └─ 成功
+    │
+    ├─ 同步收尾（Like / Undo:Like 事务）
+    │    ├─ 事务失败
+    │    │    └─ return error → handler.All() / handleHTTPError() → 500
+    │    └─ 成功 → RenderActivityJSON(..., 200)
+    │
+    └─ goroutine 收尾（Follow / Undo:Follow）
+         ├─ 失败 → 只记日志，状态码不变
+         └─ 成功 → 本地状态补齐
+```
+
+**注意**：`handleHTTPError` 中的类型断言使用 `err.(impart.HTTPError)` 值类型，这一点和 `getActor` 一致，也正好构成了下面 Undo 回调 bug 的参照物。
+
+---
+
+### 4.9 Undo 回调中的类型断言 Bug
+
+这是一个**实际存在的代码缺陷**，会导致 404 专项日志永远无法输出。
+
+#### 4.9.1 问题代码
+
+Undo:Follow 分支 [activitypub.go:L522-L529](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L522-L529):
+
+```go
+remoteUser, err = getRemoteUser(app, to.String())
+if err != nil {
+    if iErr, ok := err.(*impart.HTTPError); ok {  // ← 指针类型断言
+        if iErr.Status == http.StatusNotFound {
+            log.Error("No remoteuser info for Undo event!")
+        }
+    }
+    return err
+}
+```
+
+#### 4.9.2 为什么断言永远失败？
+
+`getRemoteUser` 返回 404 时的代码 [activitypub.go:L1005-L1007](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1005-L1007):
+
+```go
+return nil, impart.HTTPError{http.StatusNotFound, "No remote user with that ID."}
+```
+
+返回的是 `impart.HTTPError` **值类型**。
+
+Go 的类型断言规则：
+- `err.(impart.HTTPError)` → 匹配值类型 ✓
+- `err.(*impart.HTTPError)` → 匹配指针类型 ✗
+
+当 `getRemoteUser` 返回 `impart.HTTPError{...}` 时，接口 `error` 中存储的是**值**。`err.(*impart.HTTPError)` 尝试断言为指针，**永远不匹配**，`ok` 永远是 `false`。
+
+#### 4.9.3 对比：getActor 中的正确写法
+
+`getActor` 中 [activitypub.go:L1058](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/activitypub.go#L1058):
+
+```go
+if iErr, ok := err.(impart.HTTPError); ok {  // ← 值类型断言，正确！
+    if iErr.Status == http.StatusNotFound {
+```
+
+同样是调用 `getRemoteUser`，`getActor` 用值类型断言，能正确识别 404。Undo 回调用指针类型断言，识别不了。
+
+#### 4.9.4 实际影响
+
+**1. 日志丢失**
+
+`"No remoteuser info for Undo event!"` 这条日志**永远不会输出**。当远程用户不存在于本地数据库时，开发者无法通过日志区分"用户不存在（404）"和"数据库出错（500 等）"。
+
+**2. 错误仍被吞成 200**
+
+断言失败并不影响错误传播——`return err` 仍然执行，error 被传到 `res.Deserialize`，最终渲染为 200 OK。所以远程端不受影响，只是本地丢失了诊断信息。
+
+**3. 全项目断言风格统计**
+
+搜索整个代码库中 `impart.HTTPError` 的类型断言：
+
+| 断言方式 | 代码库中出现次数 | 位置 |
+|---------|----------------|------|
+| `err.(impart.HTTPError)` 值类型 | 20+ 处 | handle.go, posts.go, database.go, collections.go, account.go, oauth_test.go, activitypub.go:getActor |
+| `err.(*impart.HTTPError)` 指针类型 | **仅 1 处** | activitypub.go:L524（Undo 回调） |
+
+唯一使用指针断言的地方就是 Undo 回调，这几乎确定是一个笔误而非有意为之。
+
+#### 4.9.5 修复方案
+
+将 L524 的指针断言改为值断言：
+
+```go
+// 修复前：
+if iErr, ok := err.(*impart.HTTPError); ok {
+
+// 修复后：
+if iErr, ok := err.(impart.HTTPError); ok {
+```
+
+修复后，当 `getRemoteUser` 返回 404 时，日志能正确输出 `"No remoteuser info for Undo event!"`，开发者可以区分"用户不存在"和"其他数据库错误"。
+
+#### 4.9.6 更深层的设计问题
+
+即使修复了类型断言，这段逻辑仍然存在设计上的局限性：
+
+1. **只区分 404，不区分其他错误**：如果 `getRemoteUser` 因为数据库连接断开而返回错误（非 `impart.HTTPError` 类型），Undo 回调会直接 `return err`，没有任何特殊处理。
+2. **404 时仍然返回错误**：断言成功后只记录日志，然后继续 `return err`。这意味着即使是正常的"用户不在本地"场景，也会走 `Deserialize` 的吞错路径返回 200。远程端看到的仍然是 200 OK，但 Accept 不会被发送。
+3. **Unfollow 的容错逻辑本应更宽容**：取消关注时，如果本地没有该用户记录，合理的做法是直接返回成功（200 OK），而不是返回错误再被吞。当前实现虽然最终效果相同（都是 200），但绕了一圈不必要的错误传播。
+
+---
+
 ## 5. WebFinger 发现协议
 
 **远程用户查找**：[RemoteLookup](file:///d:/fz/0601-1/solo-dogfeeding/code/33-writefreely/webfinger.go#L103-L145)
