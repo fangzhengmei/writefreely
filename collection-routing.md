@@ -140,27 +140,40 @@ WriteFreely 支持两种运行模式，通过 `App.SingleUser` 配置切换，�
 
 ---
 
-## 集合入口：带前缀与不带前缀的命中机制
+## 集合入口：四层路由与命中机制
 
-多用户模式下，集合有 **三条独立的入口路由**，按注册顺序依次匹配，见 [routes.go](file:///d:/fz/0601-1/solo-dogfeeding/code/32-writefreely/routes.go#L210-L213)：
+多用户模式下，集合相关的 URL 实际上分布在 **四个不同的路由层次** 上，而非三条"并列"的入口。理解它们的关键是：路由是按注册顺序尝试的，先注册先匹配；`/{post}` 是根级别的 catch-all 路由，承担了很多 fallback 职责。
 
-### 三条入口路由详解
+### 完整路由注册顺序（多用户模式）
 
-```go
-// 多用户模式（L210-L215）：
+路由注册位于 [routes.go](file:///d:/fz/0601-1/solo-dogfeeding/code/32-writefreely/routes.go#L205-L217)，按从上到下的顺序：
 
-// 入口 ①：带前缀字符，不带末尾斜杠
-write.HandleFunc("/{prefix:[@~$!\\-+]}{collection}", handler.Web(handleViewCollection, UserLevelReader))
-// 例：/@myblog  /~oldblog  /$-alias
-
-// 入口 ②：不带前缀，带末尾斜杠
-write.HandleFunc("/{collection}/", handler.Web(handleViewCollection, UserLevelReader))
-// 例：/myblog/   /tech-notes/
-
-// 入口 ③：前缀可选（?），挂载 RouteCollections 子路由处理所有子路径
-RouteCollections(handler, write.PathPrefix("/{prefix:[@~$!\\-+]?}{collection}").Subrouter())
-// 例：/myblog/page/2  /@myblog/tag:golang  /~oldblog/some-post-slug
 ```
+注册顺序（自上而下，先注册先匹配）：
+  ① /{prefix:[@~$!\-+]}{collection}      → handleViewCollection
+  ② /{collection}/                       → handleViewCollection
+  ③ PathPrefix /{prefix?}{collection} + 子路由（RouteCollections）
+       ├── /logout                       → handleLogOutCollection
+       ├── /page/{page}                  → handleViewCollection
+       ├── /archive/                     → handleViewCollection
+       ├── /tag:{tag}                    → handleViewCollectionTag
+       ├── /feed/                        → ViewFeed
+       ├── /sitemap.xml                  → handleViewSitemap
+       ├── /{slug}                       → CollectionPostOrStatic → viewCollectionPost
+       └── /{slug}/edit 等
+  ④ /{post}                              → handleViewPost    ← 根级 catch-all！
+  ⑤ /                                    → handleViewHome
+```
+
+### 四个层次的定位与职责
+
+| 层次 | 路由模式 | 处理函数 | 定位 |
+|------|----------|----------|------|
+| ① | `/{prefix}{collection}` | handleViewCollection | **前缀风格集合首页**：@/~/$ 等前缀 + 别名，直接进入集合视图 |
+| ② | `/{collection}/` | handleViewCollection | **规范集合首页**：带末尾斜杠的标准集合 URL |
+| ③ | `PathPrefix /{prefix?}{collection}` + 子路由 | 多个 | **集合子资源**：分页、归档、标签、文章、Feed 等所有带层级路径 |
+| ④ | `/{post}` | handleViewPost | **根级 catch-all**：帖子直链 + 集合别名 fallback |
+| ⑤ | `/` | handleViewHome | **根路径**：根据模式和用户状态分流 |
 
 ### 前缀字符说明
 
@@ -175,19 +188,79 @@ RouteCollections(handler, write.PathPrefix("/{prefix:[@~$!\\-+]?}{collection}").
 | \- | 连字符 | 需注意与 slug 中的连字符区分 |
 | + | 加号 | 增强/扩展内容标识 |
 
-前缀存储在 `collectionReq.prefix` 中，后续用于构造分页、标签、归档等 URL（保证用户的自定义前缀风格被保留）。
+前缀存储在 `collectionReq.prefix` 中（仅在层次①和③中存在），后续用于构造分页、标签、归档等 URL，保证用户的自定义前缀风格被保留。
 
-### 命中优先级与示例
+---
 
-| 请求 URL | 命中的入口 | 说明 |
-|----------|-----------|------|
-| `/@myblog` | 入口 ① | 带前缀，无斜杠，直接渲染集合首页 |
-| `/myblog/` | 入口 ② | 无前缀，有斜杠，直接渲染集合首页 |
-| `/myblog` | 入口 ③ 的 `/{slug}` 路由 | 无斜杠且无前缀，被当作集合下的文章 slug 处理（由 `CollectionPostOrStatic` → `viewCollectionPost` → `processCollectionPermissions` 逐级处理，最终在 DB 中找不到对应 slug 的文章时，通过 alias 反查集合 → 301 重定向到 `/myblog/`） |
-| `/~oldblog/feed/` | 入口 ③ | 通过子路由匹配 `/feed/` |
-| `/tech-notes/tag:go` | 入口 ③ | 通过子路由匹配 `/tag:{tag}` |
+### `/myblog` 的完整命中链路（无前缀、无斜杠）
 
-**关键修正**：之前文档中声称集合首页通过 `/{collection}/` 访问，但遗漏了无前缀无斜杠的 URL（如 `/myblog`）实际上先进入"文章路由"，再通过数据库查询的 fallback 机制来实现重定向。这是一种 **优雅降级** 的设计。
+**这是最容易被误解的一条路径**。它不匹配层次①②③，而是匹配层次④的根级 catch-all 路由 `/{post}`，然后在函数内部通过 fallback 识别为集合别名。
+
+完整链路见 [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/32-writefreely/posts.go#L314-L341) 的 `handleViewPost` 函数：
+
+```
+请求 /myblog
+  │
+  ├─► 路由层匹配：/{post} → friendlyID = "myblog"
+  │
+  ├─► handleViewPost 内部执行：
+  │     ① 检查是否是保留页面（pages map）→ 否
+  │     ② 检查是否是静态文件（含 "." 且非 raw）→ 否
+  │     ③ GetCollection("myblog") → 查到了！
+  │          └─► 301 MovedPermanently → "/myblog/"
+  │
+  └─► 如果不是集合，才继续按帖子 ID 处理
+```
+
+关键代码：
+```go
+// handleViewPost (posts.go L338-L341)
+c, _ := app.db.GetCollection(friendlyID)
+if c != nil {
+    return impart.HTTPError{http.StatusMovedPermanently, 
+        fmt.Sprintf("/%s/", friendlyID)}
+}
+```
+
+**为什么不在路由层直接匹配集合别名？**
+- 集合别名和帖子 ID 都是任意字符串，路由层面无法区分
+- 只能在业务逻辑层通过数据库查询来判定：先查集合表，命中则重定向到规范 URL；否则按帖子处理
+- 这是一种 **数据库驱动的 URL 路由** 设计
+
+---
+
+### 各种 URL 形式的命中路径对照
+
+| 请求 URL | 路由层次 | 处理函数 | 最终结果 |
+|----------|----------|----------|----------|
+| `/@myblog` | ① | handleViewCollection | 直接渲染集合首页（带前缀风格） |
+| `/myblog/` | ② | handleViewCollection | 直接渲染集合首页（规范 URL） |
+| `/myblog` | ④ → fallback | handleViewPost → 301 | 重定向到 `/myblog/`（集合别名识别） |
+| `/~oldblog/feed/` | ③ 子路由 | ViewFeed | 集合 RSS Feed |
+| `/tech-notes/tag:go` | ③ 子路由 | handleViewCollectionTag | 标签过滤页 |
+| `/myblog/hello-world` | ③ 子路由 `/` + `/{slug}` | viewCollectionPost | 集合内文章页 |
+| `/abcdefghij` | ④ → 帖子逻辑 | handleViewPost | 帖子直链（10 字符 ID） |
+| `/about` | ④ → 保留页 | handleViewPost → 模板 | 静态关于页 |
+
+---
+
+### 层次④与层次③的关系：两条独立的命名空间
+
+层次④（根级 `/{post}`）和层次③（PathPrefix 子路由的 `/{slug}`）看起来很像，都是单段路径参数，但它们属于 **完全不同的命名空间**：
+
+| 维度 | 层次④ `/{post}` | 层次③ 子路由 `/{slug}` |
+|------|-----------------|----------------------|
+| 位置 | 根路由 write 上 | PathPrefix 子路由上 |
+| 参数含义 | 帖子 ID / 集合别名 fallback | 集合内的文章 slug |
+| 命名空间 | 全局唯一（posts.id + collections.alias） | 单个集合内唯一（posts.slug） |
+| 长度约束 | 帖子 ID 固定 10 字符 | slug 任意长度 |
+| 集合上下文 | 无（posts 可能无集合） | 有（collection_id 非 NULL） |
+
+**关系总结**：
+- 层次①②③是**集合域**的路由：都以集合别名为前缀，后续路径在集合内部
+- 层次④是**全局域**的路由：帖子直链、保留页面、集合别名 fallback
+- 两者通过 `handleViewPost` 中的 `GetCollection` 检查桥接起来
+- 前缀入口（层次①）和规范入口（层次②）直接命中集合，不需要经过 fallback
 
 ---
 
