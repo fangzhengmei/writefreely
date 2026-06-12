@@ -339,8 +339,8 @@ if app.cfg.App.Federation && coll.ID > 0 {
 | `Alias` | `string` | ✅ 保留 | ✅ 保留 | ✅ 保留（blog列） | ✅ 保留（目录名） | 集合别名/URL 路径 |
 | `Title` | `string` | ✅ 保留 | ✅ 部分 | ❌ 不包含 | ❌ 不包含 | 集合显示名称 |
 | `Description` | `string` | ✅ 保留 | ✅ 部分 | ❌ 不包含 | ❌ 不包含 | 集合描述 |
-| `Direction` | `string` | ❓部分 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 排版方向 |
-| `Language` | `string` | ❓部分 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 集合默认语言 |
+| `Direction` | `string` | ❌ 丢失（空值省略） | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 排版方向，**TODO: add Direction to db**（数据库无此字段），`omitempty` 导致空值省略，无 `datastore` 标签不参与 DB 映射 |
+| `Language` | `string` | ❌ 丢失（空值省略） | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 集合默认语言，**TODO: add Language to db**（数据库无此字段），`omitempty` 导致空值省略，无 `datastore` 标签不参与 DB 映射 |
 | `StyleSheet` | `string` | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 自定义 CSS |
 | `Script` | `string` | ✅ 保留 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 自定义 JS |
 | `Signature` | `string` | ❌ 丢失 | ❌ 不包含 | ❌ 不包含 | ❌ 不包含 | 文章签名/页脚，`json:"-"` |
@@ -428,11 +428,145 @@ id, view_count, title, language, created, updated, content
 
 ---
 
-### 6.2 导入前置校验：导致整单中断的场景
+### 6.2 上传失败完整处理流程与边界条件
+
+#### 6.2.1 导入请求完整时序（含所有错误分支）
+
+```
+请求入口
+   │
+   ▼
+【路由层：登录态校验】
+   │
+   ├─ 失败 → 返回 401 错误 → END（整单中断，无任何处理）
+   │
+   ▼
+进入 handleImport 函数 [account_import.go L57]
+   │
+   ├─ L59: r.ParseMultipartForm(10 << 20)  ── 10MB 限制，未检查 err
+   │
+   ├─ L61: collAlias = r.PostFormValue("collection")
+   │
+   ├─【目标集合存在性校验】[L66-L71]
+   │   │
+   │   ├─ collAlias 非空时执行
+   │   ├─ app.db.GetCollection(collAlias)
+   │   ├─ 失败 → return err → END（整单中断）
+   │   │
+   │   ▼
+   ├─【集合所有权校验】[L73-L77]
+   │   │
+   │   ├─ 检查 coll.OwnerID == u.ID
+   │   ├─ 失败 → 加 Flash + return err → END（整单中断）
+   │   │
+   │   ▼
+   ├─【fileDates JSON 格式校验】[L82-L86]
+   │   │
+   │   ├─ json.Unmarshal(fileDates JSON)
+   │   ├─ 失败 → return 400 Bad Request → END（整单中断）
+   │   │
+   ├─ 以上 4 项全部通过 → 进入文件处理循环
+   │
+   ▼
+┌─────────────────────────────────────────────────────────┐
+│  for _, formFile := range files {                       │  ← 循环开始，单文件失败不影响其他文件
+│     │                                                  │
+│     ├─【文件打开】[L94-L99]                             │
+│     │  ├─ 失败 → 加 err + continue → 下一个文件        │
+│     │                                                  │
+│     ├─【临时文件创建】[L102-L107]                       │
+│     │  ├─ 失败 → 加 err + continue → 下一个文件        │
+│     │                                                  │
+│     ├─【文件复制】[L110-L115]                           │
+│     │  ├─ 失败 → 加 err + continue → 下一个文件        │
+│     │                                                  │
+│     ├─【文件 Stat】[L117-L122]                          │
+│     │  ├─ 失败 → 加 err + continue → 下一个文件        │
+│     │                                                  │
+│     ├─ 以上全部成功 → 进入内容解析                     │
+│     │                                                  │
+│     ├─【内容解析】[L130-L143]                           │
+│     │  │                                               │
+│     │  ├─ ErrEmptyFile → 单独 Flash + continue        │  ← 不计入 fileErrs
+│     │  ├─ ErrInvalidContentType → 单独 Flash + continue│  ← 不计入 fileErrs
+│     │  └─ 其他错误 → 加 err + continue → 下一个文件    │
+│     │                                                  │
+│     ├─【数据库创建文章】[L157-L162]                     │
+│     │  │                                               │
+│     │  ├─ CreatePost 内部包含 Slug 冲突重试            │
+│     │  ├─ 重试成功 → 文章创建成功                      │
+│     │  └─ 失败（包括重试失败）→ 加 err + continue      │
+│     │                                                  │
+│     ├─【联邦分发（异步）】[L165-L177]                   │
+│     │  ├─ go federatePost(...)                         │
+│     │  └─ 后台执行，失败不影响导入结果                  │
+│     │                                                  │
+│     └─ filesImported++ → 成功计数 +1                   │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+   │
+   ▼
+【结果状态判定】[L180-L192]
+   │
+   ├─ filesImported == filesSubmitted → SUCCESS Flash
+   ├─ filesImported > 0 → INFO Flash
+   └─ 全部失败 → 无成功/信息 Flash，仅错误列表
+   │
+   ▼
+return 302 Redirect /me/import → END
+```
+
+#### 6.2.2 整单中断 vs 单文件继续：精确边界对照表
+
+| 检查阶段 | 代码位置 | 触发条件 | 处理方式 | 已创建文章是否保留 | 临时文件是否清理 |
+|---------|---------|---------|---------|-----------------|----------------|
+| **登录态校验** | 路由层 `handler.User()` | Session/Token 无效 | **整单中断** | ❌ 无 | ❌ 无 |
+| **集合存在性** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L66-L71 | `collAlias` 非空但集合不存在 | **整单中断** | ❌ 无 | ❌ 无 |
+| **集合所有权** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L73-L77 | `coll.OwnerID != u.ID` | **整单中断** | ❌ 无 | ❌ 无 |
+| **fileDates JSON** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L82-L86 | JSON 解析失败 | **整单中断** | ❌ 无 | ❌ 无 |
+| **文件打开失败** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L94-L99 | `formFile.Open()` 失败 | **单文件继续** | ✅ 之前成功的保留 | ⚠️ defer 关闭已打开的 |
+| **临时文件创建失败** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L102-L107 | `os.CreateTemp()` 失败 | **单文件继续** | ✅ 之前成功的保留 | ⚠️ 源文件 defer 关闭 |
+| **文件复制失败** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L110-L115 | `io.Copy()` 失败 | **单文件继续** | ✅ 之前成功的保留 | ⚠️ 源文件 defer 关闭，临时文件 defer Close |
+| **文件 stat 失败** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L117-L122 | `tempFile.Stat()` 失败 | **单文件继续** | ✅ 之前成功的保留 | ⚠️ defer 关闭 |
+| **内容解析-空文件** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L131-L134 | `wfimport.ErrEmptyFile` | **单文件继续** | ✅ 之前成功的保留 | ⚠️ defer 关闭，临时文件残留 |
+| **内容解析-类型错误** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L135-L138 | `wfimport.ErrInvalidContentType` | **单文件继续** | ✅ 之前成功的保留 | ⚠️ defer 关闭，临时文件残留 |
+| **内容解析-其他错误** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L139-L143 | 其他解析错误 | **单文件继续** | ✅ 之前成功的保留 | ⚠️ defer 关闭，临时文件残留 |
+| **数据库创建失败** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L157-L162 | `CreatePost()` 失败（含 Slug 重试失败） | **单文件继续** | ✅ 之前成功的保留 | ⚠️ defer 关闭，临时文件残留 |
+| **联邦分发失败** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L165-L177 | goroutine 内异步失败 | **不计入失败** | ✅ 文章已创建 | ⚠️ 不影响 |
+
+#### 6.2.3 边界条件详细说明
+
+**整单中断的 4 个必要条件：**
+1. 必须发生在 **for 循环之前**
+2. 必须通过 `return err` 直接跳出函数
+3. 此时还没有处理任何文件
+4. 用户需要重新选择文件并提交
+
+**整单中断后系统状态：**
+- ✅ 数据库中没有创建任何文章
+- ✅ 没有创建任何临时文件
+- ✅ 没有触发任何联邦分发
+- ✅ 已添加的 Flash 消息（所有权校验失败时）会显示给用户
+
+**单文件继续处理的 3 个必要条件：**
+1. 必须发生在 **for 循环内部**
+2. 必须通过 `continue` 跳过当前迭代
+3. 已成功处理的文件不受影响
+
+**临时文件残留问题：**
+- 临时文件命名模式：`post-upload-*.txt`
+- 创建位置：操作系统临时目录（`os.TempDir()`）
+- 清理时机：匿名函数返回时 `Close()`，但**不会删除**
+- 依赖操作系统的临时文件清理机制自动删除
+- 导入失败或成功后，这些文件都不会被主动清理
+
+---
+
+### 6.3 导入前置校验：导致整单中断的场景
 
 **前置校验定义：** 在进入文件循环处理之前执行的检查，一旦失败则整个导入请求终止，不处理任何文件。
 
-#### 6.2.1 前置校验清单（按执行顺序）
+#### 6.3.1 校验点详情
 
 | 序号 | 校验点 | 代码位置 | 失败表现 | HTTP状态码 | 说明 |
 |-----|-------|---------|---------|-----------|------|
@@ -442,7 +576,7 @@ id, view_count, title, language, created, updated, content
 | 4 | **集合所有权校验** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L73-L77 | flash + 错误返回 | 401 | `coll.OwnerID != u.ID` 时禁止导入到他人集合 |
 | 5 | **fileDates JSON 格式** | [account_import.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/account_import.go) L82-L86 | Bad Request 错误 | 400 | `json.Unmarshal` 失败则整单中断 |
 
-#### 6.2.2 各校验点详细分析
+#### 6.3.2 各校验点详细分析
 
 **1. 登录态校验（路由中间件）**
 - **触发时机**：请求到达 `handleImport` 函数之前
@@ -501,7 +635,7 @@ if err != nil {
 - **失败影响**：返回 400 Bad Request，整单失败
 - **失败原因**：前端 JS 异常、恶意构造请求、JSON 格式错误
 
-#### 6.2.3 前置校验失败后的状态
+#### 6.3.3 前置校验失败后的状态
 
 **所有前置校验失败都具有以下共性：**
 - ✅ 数据库中不会创建任何文章
@@ -512,13 +646,13 @@ if err != nil {
 
 ---
 
-### 6.3 单文件失败场景分析
+### 6.4 单文件失败场景分析
 
 **单文件失败定义：** 在文件循环内发生的错误，仅影响当前文件，其他文件继续处理。
 
 **代码结构：** `for _, formFile := range files` 循环内的所有错误都使用 `continue` 跳过当前文件。
 
-#### 6.3.1 单文件失败类型总览
+#### 6.4.1 单文件失败类型总览
 
 | 类别 | 错误场景 | 错误消息格式 | 是否计入 fileErrs | 反馈方式 |
 |-----|---------|-------------|------------------|---------|
@@ -531,7 +665,7 @@ if err != nil {
 | **内容解析** | 其他解析错误 | `failed to read copy of {filename}` | ✅ 是 | 错误列表 |
 | **数据库** | 创建文章失败 | `failed to create post from {filename}` | ✅ 是 | 错误列表 |
 
-#### 6.3.2 各阶段失败详细分析
+#### 6.4.2 各阶段失败详细分析
 
 **第一阶段：文件读取与临时化（4 种失败）**
 
@@ -628,7 +762,7 @@ filesImported++  // 无论联邦成功与否，都算作导入成功
 - **用户感知**：用户无法从导入结果中得知联邦是否成功
 - **日志**：联邦失败会记录到服务端日志，但不返回给用户
 
-#### 6.3.3 错误消息的两种渲染方式
+#### 6.4.3 错误消息的两种渲染方式
 
 **方式一：错误列表（`fileErrs` 聚合）**
 ```go
@@ -648,7 +782,7 @@ _ = addSessionFlash(app, w, r, fmt.Sprintf("%s was empty, import skipped", formF
 - 在模板中也通过 `.Flashes` 渲染
 - 与错误列表混合显示，没有视觉区分
 
-#### 6.3.4 成功/失败计数逻辑
+#### 6.4.4 成功/失败计数逻辑
 
 ```go
 filesSubmitted := len(files)  // 提交文件总数
@@ -712,7 +846,7 @@ if filesImported == filesSubmitted {
 
 ---
 
-## 七、关键数据结构速查表
+## 八、关键数据结构速查表
 
 ### SubmittedPost（导入提交）
 [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/37-writefreely/posts.go) L92-L100
@@ -762,7 +896,7 @@ type Collection struct {
 
 ---
 
-## 八、导入流程时序图（简化）
+## 九、导入流程时序图（简化）
 
 ```
 用户浏览器                     后端服务                    数据库
@@ -805,7 +939,7 @@ type Collection struct {
 
 ---
 
-## 九、安全与权限校验点
+## 十、安全与权限校验点
 
 | 校验点 | 代码位置 | 校验规则 |
 |-------|---------|---------|
