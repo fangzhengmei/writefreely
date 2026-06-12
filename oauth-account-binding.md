@@ -141,7 +141,19 @@ type oauthClient interface {
 | Write.as | `"write.as"` | [oauth_writeas.go](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth_writeas.go) | Write.as 自有 OAuth |
 | Generic | `"generic"` | [oauth_generic.go](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth_generic.go) | 配置驱动的字段映射（`map_user_id`、`map_username` 等） |
 
-### 3.3 路由注册 [configureOauthRoutes](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth.go#L309-L321)
+### 3.3 路由注册
+
+初始化流程在 [routes.go:79-L83](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/routes.go#L79-L83) 按固定顺序调用 5 个配置函数（只在对应 Provider 的 `ClientID != ""` 时真正生效）：
+
+```go
+configureSlackOauth(handler, write, apper.App())    // 第 1 个
+configureWriteAsOauth(handler, write, apper.App())  // 第 2 个
+configureGitlabOauth(handler, write, apper.App())   // 第 3 个
+configureGenericOauth(handler, write, apper.App())  // 第 4 个
+configureGiteaOauth(handler, write, apper.App())    // 第 5 个
+```
+
+每个配置函数内部调用 [configureOauthRoutes](file:///d:/fz/0601-1/solo-dogfeeding/code/35-writefreely/oauth.go#L309-L321) 注册路由：
 
 ```go
 func configureOauthRoutes(parentHandler *Handler, r *mux.Router, 
@@ -152,16 +164,36 @@ func configureOauthRoutes(parentHandler *Handler, r *mux.Router,
         Store:         app.SessionStore(),
         oauthClient:   oauthClient,
         callbackProxy: callbackProxy,
+        EmailKey:      app.keys.EmailKey,
     }
+    // 路由 1：登录入口（每个 provider 路径不同，无冲突）
     r.HandleFunc("/oauth/"+oauthClient.GetProvider(), 
         parentHandler.OAuth(handler.viewOauthInit)).Methods("GET")
+    // 路由 2：回调地址（每个 provider 路径不同，无冲突）
     r.HandleFunc("/oauth/callback/"+oauthClient.GetProvider(), 
         parentHandler.OAuth(handler.viewOauthCallback)).Methods("GET")
+    // 路由 3：注册提交（⚠️ 所有 provider 路径相同 → 重复注册）
+    r.HandleFunc("/oauth/signup", 
+        parentHandler.OAuth(handler.viewOauthSignup)).Methods("POST")
 }
-// 共用注册路由：POST /oauth/signup 在所有 provider 中只注册一次
 ```
 
-每个启用的 Provider（`ClientID != ""`）都会注册自己的 `/oauth/{provider}` 和 `/oauth/callback/{provider}` 路由。
+**路由汇总表：**
+
+| 路由 | 路径 | 注册次数 | 说明 |
+|------|------|---------|------|
+| 登录入口 | `/oauth/slack`、`/oauth/write.as`、`/oauth/gitlab`、`/oauth/generic`、`/oauth/gitea` | 各 1 次 | 路径中包含 `GetProvider()`，互不冲突 |
+| OAuth 回调 | `/oauth/callback/slack`、`/oauth/callback/write.as` 等 | 各 1 次 | 路径中包含 `GetProvider()`，互不冲突 |
+| 注册提交 | **`POST /oauth/signup`** | **每个启用的 Provider 各注册 1 次** | 所有 Provider 使用**同一路径**，存在**多次注册** |
+
+**`POST /oauth/signup` 多次注册的行为：**
+
+由于 `configureOauthRoutes` 在每个启用的 Provider 配置中都会执行 `r.HandleFunc("/oauth/signup", ...)`，同一路径被重复注册给 gorilla/mux。其行为是：
+- mux 不会报错，允许同一路径+方法的多次注册
+- 匹配请求时按 **注册顺序** 找到第一个匹配的 handler
+- 也就是：**最先启用的 Provider（按 Slack → Write.as → GitLab → Generic → Gitea 顺序）的 `oauthHandler` 实例会处理所有的 `/oauth/signup` 请求**
+
+但由于 `viewOauthSignup` 处理函数**不使用** `oauthClient` 字段（所有 provider 信息都从表单隐藏字段 `provider` / `client_id` 回传），所以无论由哪个 handler 实例处理，结果都一致——这是代码能正常工作的原因。
 
 ---
 
