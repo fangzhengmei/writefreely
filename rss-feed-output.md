@@ -813,3 +813,303 @@ WriteFreely 文章发布体系
     └── 按标签筛选: /read/t/{tag}
 ```
 
+---
+
+## 10. 用户、Collection alias、作者信息的概念辨析
+
+### 10.1 三个概念的区分依据
+
+在 WriteFreely 代码体系中，用户（User）、Collection alias、作者信息（Author）是三个不同层次的概念，分别对应不同的代码实体和数据库字段。
+
+#### 用户 (User)
+
+**代码实体:** `User` 结构体，对应 `users` 表
+
+**核心字段:**
+- `ID int64` - 用户唯一标识
+- `Username string` - 登录用户名
+- `Password []byte` - 密码哈希
+- `Email zero.String` - 邮箱
+- `Status int64` - 用户状态（0=正常，非0=封禁/静默）
+
+**数据库查询函数:**
+```go
+func (db *datastore) GetUserByID(userID int64) (*User, error)
+func (db *datastore) GetUserByName(username string) (*User, error)
+```
+
+**在 RSS 中的使用:**
+- 仅当 Collection 的 `PublicOwner = true` 时，才会查询用户表获取 `Username`
+- 查询后赋值给 `coll.Owner` 字段
+
+#### Collection Alias
+
+**代码实体:** `Collection.Alias` 字段，对应 `collections.alias` 字段
+
+**定义:**
+```go
+type Collection struct {
+    ID      int64
+    Alias   string  // URL 友好的别名，用于路径路由
+    Title   string  // 显示标题
+    OwnerID int64   // 外键，关联 users.id
+    // ...
+}
+```
+
+**用途:**
+1. **URL 路由解析**: 从 `/alice/feed/` 中提取 `alice` 作为 alias 查找 Collection
+2. **子域名解析**: 从 `alice.writeas.com` 中提取 `alice` 作为 alias
+3. **Canonical URL 生成**: 生成 `https://example.com/alice/my-post` 形式的链接
+4. **Reader 作者筛选**: `/read/alice` 按 alias 过滤文章
+
+#### 作者信息 (Author)
+
+**在 RSS Feed 中的表现:**
+- **Collection RSS Feed**: `coll.Owner.Username`（用户的登录名）
+- **Reader RSS Feed**: `p.Collection.Title`（Collection 的显示标题）或 `"Anonymous"`
+
+**三者关系图:**
+```
+users 表
+├─ id (PK)
+├─ username
+└─ status
+    │
+    │ 1:N 关系
+    │
+    ▼
+collections 表
+├─ id (PK)
+├─ alias       ← URL 路径/子域名解析用
+├─ title       ← Reader Feed 作者显示用
+└─ owner_id (FK → users.id)
+    │
+    │ 1:N 关系
+    │
+    ▼
+posts 表
+├─ id (PK)
+├─ collection_id (FK → collections.id)  ← NULL 表示匿名文章
+├─ owner_id (FK → users.id)
+└─ slug         ← 语义化 URL 片段（匿名文章为 NULL）
+```
+
+### 10.2 Collection Feed 中作者信息为空的具体情形
+
+**核心代码:** [feed.go L56-L76](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/feed.go#L56-L76)
+
+```go
+// 56行: 仅当 PublicOwner 为 true 时才查询用户信息
+if c.PublicOwner {
+    u, err := app.db.GetUserByID(coll.OwnerID)
+    if err != nil {
+        log.Error("Error getting user for collection: %v", err)
+    } else {
+        coll.Owner = u  // 查询成功才赋值
+    }
+}
+// ...
+// 74行: 仅当 Owner 不为 nil 时才设置 author
+author := ""
+if coll.Owner != nil {
+    author = coll.Owner.Username
+}
+```
+
+**作者信息为空（`author = ""`）的三种情形:**
+
+| 情形 | 原因 | 代码位置 |
+|------|------|----------|
+| **情形 1: `PublicOwner = false`（默认）** | 创建 Collection 时默认 `PublicOwner = false`，此时不会调用 `GetUserByID`，`coll.Owner` 始终为 `nil` | [database.go L331](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/database.go#L331-L331) |
+| **情形 2: 用户查询失败** | 即使 `PublicOwner = true`，如果 `GetUserByID` 返回错误（如用户已删除、数据库错误），则 `coll.Owner` 仍为 `nil` | [feed.go L58-L60](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/feed.go#L58-L60) |
+| **情形 3: 用户查询成功但 Username 为空** | 理论上不会发生，但如果用户表中 `username` 字段为空，也会导致 author 为空 | `users.username` 字段 |
+
+**数据库层面的 `PublicOwner` 字段:**
+
+注意：`GetCollectionBy` 的 SELECT 语句中**并没有包含 `public_owner` 字段**：
+```sql
+SELECT id, alias, title, description, style_sheet, script, post_signature, 
+       format, owner_id, privacy, view_count 
+FROM collections WHERE ...
+```
+**代码位置:** [database.go L861](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/database.go#L861-L861)
+
+这意味着：
+- `c.PublicOwner` 始终为 Go 零值 `false`
+- **实际上 Collection Feed 的作者信息**总是空的**
+- 这是一个已知的代码缺陷（FIXME 注释也提到了 "change Collection to reflect database values"）
+
+---
+
+### 10.3 Reader 页面匿名分支无法实际访问的根本原因
+
+**代码路径:** [read.go L206-L209](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L206-L209)
+
+```go
+if author == "anonymous" {
+    if p.Collection == nil {
+        posts = append(posts, p)  // 理论上筛选匿名文章
+    }
+}
+```
+
+**为什么这个分支永远不会匹配到文章？**
+
+#### 原因 1: 数据源层的排除
+
+**`FetchPublicPosts` 的 SQL 结构:** [read.go L78-L84](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L78-L84)
+
+```sql
+FROM collections c              -- 从 collections 表开始
+LEFT JOIN posts p ON p.collection_id = c.id  -- 只 JOIN 有 collection_id 的文章
+```
+
+这个 LEFT JOIN 的方向决定了：
+- 只有 `posts.collection_id = collections.id` 的文章才会被选中
+- `posts.collection_id = NULL` 的**匿名文章根本不会出现在结果集中**
+- 因此 `app.timeline.posts` 中的所有文章都有 `p.Collection != nil`
+
+#### 原因 2: 数据结构层面的保证
+
+在 `FetchPublicPosts` 的结果处理中，每篇文章都显式设置了 Collection：
+```go
+// read.go L93-L96
+c := &Collection{
+    ID:    collID.Int64,
+    Alias: collAlias.String,
+    Title: title.String,
+}
+p.Collection = c  // 确保每篇文章都有 Collection
+```
+**代码位置:** [read.go L93-L96](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/read.go#L93-L96)
+
+#### 原因 3: 每作者文章限制的影响
+
+```go
+// read.go L108-L111
+if c.Alias != "" && ap[c.Alias] == tlMaxAuthorPosts {
+    continue
+}
+```
+这个判断也假设了 `c.Alias` 存在，进一步确认所有处理的文章都有 Collection。
+
+**结论:** `/read/anonymous` 路径存在于代码中，但**由于数据源层的 SQL JOIN 结构，永远不会返回任何文章**。这是一个"死代码"分支。
+
+---
+
+### 10.4 Feed Alias 从子域名或路径解析的完整逻辑
+
+#### 核心解析函数: `collectionAliasFromReq`
+
+**代码位置:** [collections.go L1337-L1346](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/collections.go#L1337-L1346)
+
+```go
+func collectionAliasFromReq(r *http.Request) string {
+    vars := mux.Vars(r)
+    alias := vars["subdomain"]   // 优先尝试子域名
+    isSubdomain := alias != ""
+    if !isSubdomain {
+        // 子域名为空时，回退到路径参数
+        alias = vars["collection"]
+    }
+    return alias
+}
+```
+
+#### 解析优先级
+
+1. **第一优先级: 子域名 (`subdomain`)**
+   - 来源: `mux.Vars(r)["subdomain"]`
+   - 例如: `alice.example.com` → `alice`
+
+2. **第二优先级: URL 路径 (`collection`)**
+   - 来源: `mux.Vars(r)["collection"]`
+   - 例如: `example.com/alice/feed/` → `alice`
+
+#### 路由层面的参数配置
+
+**多用户模式下的 Collection 路由前缀:** [routes.go L211-L213](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/routes.go#L211-L213)
+
+```go
+write.HandleFunc("/{prefix:[@~$!\\-+]}{collection}", handler.Web(...))
+write.HandleFunc("/{collection}/", handler.Web(...))
+RouteCollections(handler, write.PathPrefix("/{prefix:[@~$!\\-+]?}{collection}").Subrouter())
+```
+
+**路径参数匹配规则:**
+- `{prefix:[@~$!\\-+]}`: 可选前缀字符（`@`, `~`, `$`, `!`, `-`, `+`）
+- `{collection}`: 匹配 Collection alias
+
+**支持的 URL 形式:**
+| URL 形式 | 提取的 alias | 说明 |
+|---------|-------------|------|
+| `/alice/feed/` | `alice` | 无前缀 |
+| `/@alice/feed/` | `alice` | `@` 前缀 |
+| `/~alice/feed/` | `alice` | `~` 前缀 |
+| `alice.example.com/feed/` | `alice` | 子域名方式 |
+
+#### 子域名方式的数据库查询
+
+当 alias 通过子域名方式获取后，最终会调用 `GetCollection(alias)`：
+```go
+// feed.go L33
+c, err = app.db.GetCollection(alias)
+// → SELECT ... FROM collections WHERE alias = ?
+```
+
+**代码位置:** [feed.go L33](file:///d:/fz/0601-1/solo-dogfeeding/code/34-writefreely/feed.go#L33-L33)
+
+#### 单用户模式的特殊处理
+
+在单用户模式下，**alias 解析被完全跳过**：
+```go
+// feed.go L30-L31
+if app.cfg.App.SingleUser {
+    c, err = app.db.GetCollectionByID(1)  // 固定取 ID=1 的 Collection
+} else {
+    c, err = app.db.GetCollection(alias)  // 用解析的 alias 查询
+}
+```
+
+#### 查询调用链汇总
+
+```
+HTTP 请求
+    │
+    ▼
+┌──────────────────────────┐
+│ collectionAliasFromReq() │
+│ 1. vars["subdomain"]?    │  → 子域名方式（如 alice.example.com）
+│ 2. vars["collection"]?   │  → 路径方式（如 /alice/feed/）
+└──────────────────────────┘
+    │
+    ▼
+┌──────────────────────┐
+│ feed.go ViewFeed()   │
+│ 单用户? ──┐          │
+│   │       │          │
+│   ▼       ▼          │
+│ GetCollectionByID(1) │  → 固定 ID=1
+│ GetCollection(alias) │  → WHERE alias = ?
+└──────────────────────┘
+    │
+    ▼
+SELECT * FROM collections WHERE ...
+```
+
+### 10.5 字段使用位置对照表
+
+| 数据来源 | 字段 | 使用位置 | 说明 |
+|---------|------|---------|------|
+| **users 表** | `username` | Collection Feed `author` 字段 | 仅当 `PublicOwner=true` 时使用 |
+| **users 表** | `status` | `IsUserSilenced()` 检查 | 非 0 则返回 404 |
+| **collections 表** | `alias` | URL 解析、Canonical URL、Reader 筛选 | 核心标识字段 |
+| **collections 表** | `title` | Reader Feed `author` 字段 | 显示为作者名 |
+| **collections 表** | `owner_id` | `PublicOwner` 检查时查询用户 | 关联外键 |
+| **collections 表** | `privacy` | 权限检查 | `1=公开` 才可出现在 RSS |
+| **collectionattributes 表** | `monetization_pointer` | 付费内容处理 | 通过 `GetCollectionAttribute` 获取 |
+| **posts 表** | `collection_id` | 区分匿名/具名文章 | `NULL=匿名，有值=具名` |
+| **posts 表** | `slug` | 文章 URL 生成 | 匿名文章为 NULL，用 ID |
+
+
