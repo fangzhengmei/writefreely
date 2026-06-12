@@ -1,511 +1,270 @@
-# WriteFreely 文章编辑与发布流程分析
+# WriteFreely 文章编辑与发布流程
 
-## 一、核心数据模型
+## 一、两条发布路径总览
 
-### 1.1 Post 结构定义
+WriteFreely 的内容生产有两条完全独立的路径，它们共享同一个 `posts` 数据表，但通过字段组合区分身份：
 
-文章（Post）的状态不通过单独的 `status` 字段管理，而是通过以下关键字段的组合判断：
-
-| 字段 | 类型 | 含义 | 状态判断 |
-|------|------|------|----------|
-| `owner_id` | `null.Int` | 文章所有者用户 ID | NULL = 匿名文章；有值 = 用户所有 |
-| `collection_id` | `null.Int` | 所属博客集合 ID | NULL = 草稿/独立文章；有值 = 已发布到博客 |
-| `slug` | `null.String` | URL 友好的文章别名 | 有值 = 集合内文章；NULL = 独立草稿 |
-| `title` + `content` | 字符串 | 标题与正文 | 两者都为空 = 已取消发布 |
-| `created` | `time.Time` | 创建/发布时间 | 大于当前时间 = 定时发布文章 |
-
-数据结构定义在 [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L102-L127) 的 `Post` 结构体中。
-
-### 1.2 Collection 可见性级别
-
-博客集合（Collection）有四种可见性（位掩码），定义在 [collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/collections.go#L155-L159)：
-
-```go
-const CollUnlisted collVisibility = 0       // 0: 未列出
-const (
-    CollPublic    collVisibility = 1 << iota  // 1: 公开
-    CollPrivate                               // 2: 私有（仅作者可见）
-    CollProtected                             // 4: 密码保护
-)
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        作者创建内容                           │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+            ┌──────────────┴──────────────┐
+            ▼                              ▼
+   ┌─────────────────┐            ┌─────────────────┐
+   │  路径 A：独立草稿  │            │  路径 B：集合文章  │
+   │ (Anonymous Post) │            │(Collection Post)│
+   └────────┬────────┘            └────────┬────────┘
+            │                              │
+  collection_id = NULL           collection_id = 有值
+  slug = NULL                    slug = 有值(URL别名)
+            │                              │
+            └──────────────┬───────────────┘
+                           ▼
+                  可互相转换：
+        ClaimPosts(草稿→集合) / DispersePosts(集合→草稿)
 ```
 
-判断方法位于 [collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/collections.go#L218-L228)：
-- `IsPrivate()` → 检查 `CollPrivate` 位
-- `IsProtected()` → 检查 `CollProtected` 位
-- `IsPublic()` → 检查 `CollPublic` 位
+**状态的本质**：没有独立的 `status` 字段。一篇文章是"草稿"还是"已发布"，完全由 `collection_id` 是否为空决定。标题+正文同时为空则表示"已取消发布（Gone）"。
 
 ---
 
-## 二、草稿保存机制
+## 二、进入编辑：两种入口的权限约束节点
 
-草稿保存分为**浏览器本地**和**服务端数据库**两个层级。
+### 2.1 路径 A：独立草稿编辑入口
 
-### 2.1 浏览器本地草稿 (localStorage)
+**用户访问路径**：`/me/posts`（我的草稿列表）→ 点击某篇草稿的"edit" → `/d/{id}/edit`
 
-在编辑器模板 [pad.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/pad.tmpl#L149-L160) 中定义：
+**权限约束发生在进入编辑器时**（不是查询列表时）：
 
-- **新文章**：`draftDoc = 'lastDoc'`，保存到 localStorage key `lastDoc`
-- **编辑已有文章**：`draftDoc = 'draft{PostId}'`，保存到 `draft{id}`
-
-相关 JS 逻辑：
-- 自动保存：通过 `typingTimer` 在输入 200ms 后调用 `H.save($writer, draftDoc)`
-- 加载草稿：`H.load($writer, draftDoc, true, updated)`，并对比服务器 `updated` 时间判断是否有别处修改
-- 字体偏好：`draft{id}font` 或 `padFont`
-- 冲突检测：若本地 `draft{id}-published` 时间早于服务器 `updated`，显示 "edited elsewhere" 警告
-
-### 2.2 服务端草稿（数据库）
-
-服务端"草稿"的判定条件：**文章有 `owner_id` 但 `collection_id` 为 NULL**。
-
-草稿创建流程位于 [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L675-L772) 的 `CreatePost()`：
-- `collID <= 0` → `ownerCollID.Valid = false`，即 `collection_id` 为 NULL
-- 仅当指定了集合时才生成 `slug` 字段
-
-用户草稿列表查询条件见 [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L2030)：
-```sql
-SELECT COUNT(*) FROM posts WHERE owner_id = ? AND collection_id IS NULL
 ```
+GET /d/{id}/edit
+    │
+    ▼
+handleViewPad() 接收请求
+    │
+    ├─ 从 URL 取出文章 ID（action 参数）
+    │
+    ├─ getRawPost(id) 直接查 posts 表
+    │      │
+    │      └─ 仅按 id 查询，不检查用户，不检查时间
+    │
+    └─ 权限校验（约束节点）：
+           对比当前登录用户 ID ≟ 文章的 owner_id
+           ├─ 相等 → 渲染编辑器
+           └─ 不等 → 302 重定向到文章公开页（不让编辑）
+```
+
+**草稿列表查询本身不过滤权限**：`GetAnonymousPosts(u)` 的 SQL 条件是 `WHERE owner_id = u.ID`，天然只返回当前用户的草稿，所以列表页不需要额外权限检查。也**不做时间过滤**——作者可以看到自己所有草稿，包括定时发布在未来的。
+
+### 2.2 路径 B：集合文章编辑入口
+
+**用户访问路径**：进入某个博客（Collection）→ 在文章列表点击"edit" → `/{collAlias}/{slug}/edit`
+
+**权限约束有两层，先查集合、再查文章**：
+
+```
+GET /{collAlias}/{slug}/edit
+    │
+    ▼
+第1层：集合级权限约束（processCollectionPermissions）
+    │
+    ├─ 查集合是否存在
+    │
+    ├─ 集合是 Private（私有）？
+    │   └─ 非作者 → 404（连集合存在都不暴露）
+    │
+    ├─ 集合是 Protected（密码保护）？
+    │   ├─ 作者被禁言(silenced) → 404
+    │   ├─ 已输入过密码(Cookie授权) → 放行
+    │   └─ 未授权 → 渲染密码输入页，中断流程
+    │
+    └─ Public / Unlisted → 放行
+    │
+    ▼
+第2层：文章级权限约束（handleViewPad 内）
+    │
+    ├─ getRawCollectionPost(slug, collAlias) 按 slug+集合查文章
+    │
+    └─ 对比当前登录用户 ID ≟ 文章 owner_id
+           ├─ 相等 → 渲染编辑器
+           └─ 不等 → 302 重定向
+```
+
+### 2.3 两条路径权限差异对照
+
+| 对比维度 | 独立草稿编辑 | 集合文章编辑 |
+|---------|------------|------------|
+| 列表查询时权限 | SQL 自带 `owner_id = ?`，天然隔离 | 列表本身受集合权限约束（Private=404 等） |
+| 进入编辑器前检查 | 仅检查 `owner_id` | 先检查集合可见性 + 密码授权，再检查 `owner_id` |
+| 定时文章可见性 | 列表中全部可见，无 Scheduled 标记 | 非作者列表中被 SQL 过滤掉；作者可见并带 Scheduled badge |
+| URL 特征 | `/d/{id}/edit`（单用户模式加 `/d` 前缀） | `/{coll}/{slug}/edit` |
 
 ---
 
-## 三、发布状态转换
+## 三、发布与状态转换
 
-### 3.1 状态转换总图
+### 3.1 发布的本质 = 关联集合
 
-```
-创建新文章 ──▶ [草稿: owner_id有值, collection_id=NULL]
-                    │
-                    │ ClaimPosts (设置 collection_id + slug)
-                    ▼
-           [已发布: owner_id有值, collection_id有值]
-                    │
-                    │ DispersePosts (collection_id 设为 NULL)
-                    ▼
-           [退回草稿状态]
-                    │
-                    │ 将 title + content 清空
-                    ▼
-           [已取消发布 (Gone)]
-```
+"发布一篇草稿到博客"在数据层面只做一件事：给 `posts` 表的那一行填上 `collection_id` 和 `slug`。
 
-### 3.2 草稿 → 发布到集合（ClaimPosts）
+| 操作 | 数据变化 | 触发点 |
+|------|---------|--------|
+| 草稿 → 已发布 | `collection_id` 从 NULL → 有值；`slug` 从 NULL → 生成别名 | 前端 `postActions.move()` 调 `/api/collections/{alias}/collect` |
+| 已发布 → 草稿 | `collection_id` 从有值 → NULL；`slug` 保留但不再被使用 | 前端选"Draft"调 `/api/posts/disperse` |
+| 彻底取消发布 | `title` 和 `content` 同时被清空 | 作者在编辑器删除内容 |
 
-API 端点：`POST /api/collections/{alias}/collect` 或 `POST /api/posts/claim`
+### 3.2 slug 的生成逻辑
 
-处理函数：
-- HTTP 层：[posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L950-L1014) `addPost()`
-- DB 层：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L1698-L1896) `ClaimPosts()`
-
-核心 SQL（已有所有权的文章）见 [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L1804)：
-```sql
-UPDATE posts SET collection_id = ?, slug = ? WHERE id = ? AND owner_id = ?
-```
-
-slug 生成逻辑：
-1. 用户指定 `post.Slug` → 使用用户值
-2. 否则：优先从 `Title` 生成，其次从 `Content` 生成（`getSlugFromPost`）
-3. 最后 fallback：使用文章 ID
-
-slug 重复处理：`AttemptClaim()` 递归调用 `id.GenSafeUniqueSlug()` 添加随机后缀
-
-### 3.3 已发布 → 草稿（DispersePosts）
-
-API 端点：`POST /api/posts/disperse`
-
-处理函数：
-- HTTP 层：[posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L1016-L1049) `dispersePost()`
-- DB 层：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L1621-L1696) `DispersePosts()`
-
-核心 SQL 见 [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L1671)：
-```sql
-UPDATE posts SET collection_id = NULL WHERE id = ? AND owner_id = ?
-```
-
-### 3.4 前端触发：文章移动操作
-
-前端 JS 位于 [static/js/postactions.js](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/static/js/postactions.js)：
-
-- 移动到集合：`He.postJSON("/api/collections/" + collAlias + "/collect", ...)`
-- 移为草稿（特殊别名 `|anonymous|`）：`He.postJSON("/api/posts/disperse", ...)`
-
-### 3.5 取消发布 (Unpublished/Gone)
-
-判定条件：`title == "" && content == ""`
-
-检查位置：
-- 独立文章：[posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L454-L467) `handleViewPost()`
-- 集合文章：[posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L1594-L1597) `viewCollectionPost()`
-- DB 查询：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L1142-L1144) `GetEditablePost()`
+发布到集合时需要一个 URL 友好的别名（slug）：
+1. 如果作者在元数据页指定了 slug → 用指定值
+2. 否则从标题生成；没标题就从正文前几个字生成
+3. 都不行就用文章 ID 本身
+4. 如果 slug 和集合内已有文章冲突，自动加随机后缀重试
 
 ---
 
-## 四、编辑器页面流程
+## 四、定时发布的可见性问题：为什么列表和详情不一致
 
-### 4.1 路由定义
+### 4.1 现象描述
 
-编辑器路由在 [routes.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/routes.go#L196-L216)：
+假设一篇集合文章设置了 `created = 未来某个时间`（即定时发布）：
 
-| 模式 | 单用户模式前缀 | 路径 | 说明 |
-|------|----------------|------|------|
-| 新建 | `/me/new` | `/new` | `handleViewPad` |
-| 编辑草稿 | `/d/{id}/edit` | `/{id}/edit` | `handleViewPad` |
-| 编辑集合文章 | `/{slug}/edit` | `/{slug}/edit` | `handleViewPad` |
-| 编辑元数据 | `/d/{id}/meta` + `/{slug}/edit/meta` | 同上 | `handleViewMeta` |
+- **在博客列表页**：非作者看不到这篇文章；作者能看到，且标题旁有 "Scheduled" 标记
+- **在文章详情页**：只要有人知道完整 URL（`/{coll}/{slug}`），**任何人都可以直接访问并看到全文**，即使发布时间还没到
 
-单用户模式下，草稿路径加前缀 `/d` 避免与集合 slug 冲突。
+### 4.2 根因：两个查询函数的设计不对称
 
-### 4.2 编辑器加载逻辑
+| 查询函数 | 用途 | 有无 `created <= NOW()` 过滤 |
+|---------|------|----------------------------|
+| `GetPosts(includeFuture)` | 列表查询（博客首页、归档、标签页） | 有。`includeFuture=false` 时加 `AND created <= NOW()` |
+| `GetPost(id, collectionID)` | 单篇详情查询 | **没有**。直接按 slug/id 返回，不检查时间 |
 
-`handleViewPad()` 在 [pad.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/pad.go#L23-L121)：
+列表查询的 `includeFuture` 参数在所有调用点都传入 `isCollOwner`（是否是集合所有者），所以作者能看到未来文章、其他人看不到。
 
-1. 无 `action`/`slug` → 新建文章，`Editing = false`
-2. 有 `slug` → 集合文章编辑：`getRawCollectionPost()`，校验 `OwnerID`
-3. 有 `action`（ID）→ 独立草稿编辑：`getRawPost()`
-4. 权限校验：非作者 302 跳回文章页面
-5. 反缓存头：`Cache-Control: no-cache, no-store, must-revalidate`
+但是单篇查询 `GetPost` 没有对应的参数，也没有时间判断。只要 slug 和 collection_id 匹配就返回。
 
-### 4.3 独立草稿 vs 集合文章：编辑入口权限差异
+### 4.3 设计意图推测
 
-#### 独立草稿入口（`/me/posts` 页面）
+这是一种**"通过不公开实现保密"**的设计：
+- slug 通常由标题自动生成，如果标题是私密的，外人难以猜到完整 URL
+- 列表页是主要的发现入口，过滤掉定时文章就达到了"未发布不被发现"的目的
+- 如果作者主动把 URL 分享给别人，则视为授权提前查看
 
-**Web 页面**：[account.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/account.go#L774-L818) `viewArticles()`
-- 数据库查询：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L2129-L2166) `GetAnonymousPosts(u, page)`
-- SQL 条件：`WHERE owner_id = ? AND collection_id IS NULL ORDER BY created DESC`
-- **无 `created <= NOW()` 过滤**：作者能看到包括定时发布在内的所有草稿
-- 无额外集合权限检查（因为 `collection_id` 本身就是 NULL）
+代码本身承认了这个参数命名有误导性（注释 TODO：`change includeFuture to isOwner, since that's how it's used`）。
 
-**API 接口**：[account.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/account.go#L713-L758) `viewMyPostsAPI()`
-- `GET /api/me/posts?anonymous=1` → 调用 `GetAnonymousPosts(u, page)`
-- 分页：每页 10 条，无时间过滤
+### 4.4 独立草稿列表的特殊情况
 
-#### 集合文章入口
-
-**列表页**：[collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/collections.go#L600-L616)
-- 数据库查询：`GetPosts(..., includeFuture=isCollOwner, ...)`
-- 非作者：自动加上 `AND created <= NOW()`，过滤掉定时发布文章
-- 作者：`includeFuture=true`，看到包括定时发布在内的所有文章
-
-**编辑页加载**：[pad.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/pad.go#L89-L102)
-- 集合文章：`getRawCollectionPost(slug, collAlias)`，校验 `OwnerID`
-- 独立草稿：`getRawPost(action)`，仅校验文章存在
-
-#### 权限差异总结表
-
-| 维度 | 独立草稿入口 | 集合文章入口 |
-|------|-------------|-------------|
-| 路由前缀 | `/d/{id}/edit` 或 `/{id}/edit` | `/{coll}/{slug}/edit` |
-| DB 查询函数 | `GetAnonymousPosts` / `getRawPost` | `GetPosts` / `getRawCollectionPost` |
-| SQL 条件 | `collection_id IS NULL` | `collection_id = ?` |
-| 时间过滤 | 无（作者看到所有） | 非作者有 `created <= NOW()` |
-| 集合权限检查 | 仅编辑时检查 `OwnerID` | 前置 `processCollectionPermissions()` |
-| 页面模板 | [articles.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/user/articles.tmpl) | [include/posts.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/include/posts.tmpl) |
-
-### 4.4 编辑器模板
-
-主模板 [pad.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/pad.tmpl)：
-
-- 目标选择菜单：列出所有可发布博客 + "Draft" 选项
-- 工具区：元数据编辑、主题切换、预览、发布按钮
-- 发布按钮禁用条件：内容为空 或 编辑时内容未改变（`$writer.el.value == origDoc`）
-- 异步发布：调用 `newPost()` 或 `existingPost()`，成功后清除对应 localStorage 草稿
+独立草稿列表（`/me/posts`）的模板中**没有 Scheduled badge 的判断**。即使草稿设置了未来发布时间，作者在草稿列表里也看不到任何"Scheduled"标记。原因是：草稿本身就等于"未发布"，Scheduled 标记只对集合内的文章有意义。
 
 ---
 
-## 五、文章保存/更新流程
+## 五、页面渲染：四层权限层叠模型
 
-### 5.1 创建新文章 (newPost)
+当一篇文章被渲染成 HTML 时，权限检查不是一个单点判断，而是从外到内共四层检查逐层生效。任何一层未通过都会中断渲染。
 
-HTTP 处理：[posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L553-L699) `newPost()`
+```
+                     HTTP 请求到达
+                          │
+          ┌───────────────┴───────────────┐
+          ▼                               ▼
+   独立文章 URL                    集合文章 URL
+   (/{id})                         (/{coll}/{slug})
+          │                               │
+          │                      ┌────────▼─────────┐
+          │                      │ 第 1 层：集合级    │
+          │                      │ processCollection  │
+          │                      │  Permissions      │
+          │                      │  Private → 404    │
+          │                      │  Protected→密码页  │
+          │                      └────────┬──────────┘
+          │                               │
+          │                      ┌────────▼─────────┐
+          │                      │ 第 2 层：文章级    │
+          │                      │ viewCollectionPost│
+          │                      │  Private二次校验   │
+          │                      │  Gone→410         │
+          │                      │  silenced→404     │
+          │                      └────────┬──────────┘
+          └───────────────┬───────────────┘
+                          ▼
+                 ┌─────────────────┐
+                 │ 第 3 层：内容级    │
+                 │ handleViewPost   │
+                 │ (独立文章走这里)  │
+                 │ protectDraft检查  │
+                 │ Gone→410         │
+                 │ silenced→404     │
+                 └────────┬────────┘
+                          ▼
+                 ┌─────────────────┐
+                 │ 第 4 层：模板级    │
+                 │ 渲染 + 展示差异   │
+                 │ IsOwner 控制按钮  │
+                 │ IsScheduled徽章   │
+                 │ paid/more 截断    │
+                 └─────────────────┘
+```
 
-数据流：
-1. 鉴权：`Authorization` header → `accessToken`；否则取 Cookie Session
-2. 参数解析：JSON Body 或 Form Data
-3. 内容校验：标题+正文均为空 → `ErrNoPublishableContent`
-4. 字体校验：无效值 fallback 为 `"norm"`
-5. DB 调用：
-   - 有 token → `CreateOwnedPost()`（内部调 `CreatePost`）
-   - 有 session → 直接 `CreatePost(userID, collID, p)`
-6. 后置操作：
-   - 非私有集合且开启联邦 → `go federatePost()`
-   - 开启邮件订阅 → 插入 `PostJob{Action: "email"}`
+### 第 1 层：集合级权限（仅集合文章有）
 
-### 5.2 更新已有文章 (existingPost)
+- **Private 集合**：非作者一律 404，甚至不告诉你这个博客存在
+- **Protected 集合**：非作者需要输入密码，授权存在 Cookie 中，每个集合独立授权
+- **silenced（被禁言）的作者**：其 Protected 集合对外也表现为 404
 
-HTTP 处理：[posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L701-L832) `existingPost()`
+### 第 2 层：文章级权限
 
-DB 更新：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L776-L854) `UpdateOwnedPost()`
+- 集合文章在 `viewCollectionPost` 中**又做了一次 Private/Protected 检查**（双重保险）
+- `title == "" && content == ""`（已取消发布）→ 410 Gone
+- 作者被 silenced 且访问者不是作者/管理员 → 404
 
-特点：**增量更新**，仅更新传入字段（通过指针 nil 判断）：
-- `slug`、`content`、`title`、`language`、`rtl`、`font`、`created`
-- 始终更新 `updated = NOW()`
-- 授权条件：`WHERE id = ? AND owner_id = ?`
+### 第 3 层：内容级权限（独立文章的 protectDraft）
 
-Web 表单更新成功后 302 跳转：
-- 集合文章 → `/{collAlias}/{slug}/edit/meta`
-- 独立草稿 → `/d/{id}/meta`（单用户）或 `/{id}/meta`
+独立文章的 URL `/{id}` 本身是公开的。但是如果这篇文章的 `collection_id` 指向了一个 Private 或 Protected 集合，那么非作者访问这篇独立 URL 也会被 404。这是为了防止有人通过"先发布到私有集合、再记住独立 ID"的方式绕过集合权限。
+
+### 第 4 层：模板级展示差异
+
+即使通过了前面所有检查，最终渲染的 HTML 仍会根据访问者身份有差异：
+
+| 展示元素 | 作者 | 非作者 |
+|---------|------|--------|
+| edit / delete / pin 操作按钮 | ✅ 显示 | ❌ 隐藏 |
+| Scheduled badge（集合内定时文章） | ✅ 显示 | ✅ 也显示（如果能进来） |
+| `<!--more-->` 截断 | 列表页截断，详情页全文 | 同左 |
+| `<!--paid-->` 付费内容截断 | 全文可见，标有"订阅内容开始"提示 | 截断，显示 Coil 会员提示 |
+| 集合签名追加 | 受 `<!--nosig-->` 控制 | 同左 |
+| 邮件订阅表单 | 作者看到"你已订阅 / 退订" | 看到订阅输入框 |
 
 ---
 
-## 六、页面渲染与发布状态关系
+## 六、未发布内容（Gone）的渲染差异
 
-### 6.1 定时发布的显示差异（列表页 vs 详情页）
+"已取消发布"状态 = `title` 和 `content` 同时为空字符串。此时渲染行为取决于访问的是独立文章还是集合文章：
 
-#### `IsScheduled()` 判定方法
+| 请求方式 | 独立文章（/{id}） | 集合文章（/{coll}/{slug}） |
+|---------|------------------|------------------------|
+| 浏览器 HTML | 410 Gone 页面 | 410 Gone |
+| JSON API | HTTP 200，返回 `{"error": "Post was unpublished."}` | 410 Gone |
+| 纯文本 /md | HTTP 200，返回 "Post was unpublished." | 410 Gone |
 
-定义在 [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L286-L288)：
-```go
-func (p *Post) IsScheduled() bool {
-    return p.Created.After(time.Now())
-}
-```
-
-#### 列表页显示差异
-
-| 场景 | 查询函数 | `includeFuture` 参数 | 非作者可见性 | 作者可见性 | Scheduled Badge |
-|------|----------|---------------------|-------------|-----------|-----------------|
-| 独立草稿列表 | `GetAnonymousPosts` | 无此参数 | -（仅作者可见） | 全部可见，含定时 | ❌ 模板无判断 [articles.tmpl] |
-| 集合文章列表 | `GetPosts` | `isCollOwner` | 过滤掉（`created <= NOW()`） | 全部可见 | ✅ `<p class="badge">Scheduled</p>` |
-| 集合归档页 | `GetPosts` | `isCollOwner` | 过滤掉 | 全部可见 | ✅ `[Scheduled]` 文本标记 |
-
-**关键代码**：
-- 集合列表 badge：[include/posts.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/include/posts.tmpl#L3) `{{if .IsScheduled}}<p class="badge">Scheduled</p>{{end}}`
-- 归档页标记：[collection-archive.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/collection-archive.tmpl#L78) `{{if .IsScheduled}}[Scheduled]{{end}}`
-- SQL 过滤：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L1327-L1329)
-  ```go
-  if !includeFuture {
-      where += " AND created <= NOW()"
-  }
-  ```
-
-#### 详情页显示差异
-
-| 场景 | 处理函数 | 时间过滤 | Scheduled Badge |
-|------|----------|----------|-----------------|
-| 独立文章详情 | `handleViewPost()` | 无（`GetPost` 无时间过滤） | ❌ 模板无判断 |
-| 集合文章详情 | `viewCollectionPost()` | 无（`GetPost` 无时间过滤） | ✅ `<p class="badge">Scheduled</p>` |
-
-**集合详情页 badge**：[collection-post.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/collection-post.tmpl#L68)
-```html
-<article id="post-body" ...>{{if .IsScheduled}}<p class="badge">Scheduled</p>{{end}}...
-```
-
-#### 重要设计细节
-
-1. **`GetPost()`（单篇查询）没有 `includeFuture` 参数**：
-   - 单篇文章查询（`GetPost(slug, collID)`）不做时间过滤
-   - 只有列表查询（`GetPosts()`）才有 `includeFuture` 控制
-   - 意味着：非作者如果**知道定时发布文章的完整 slug**，可以直接访问详情页看到内容（但列表中看不到）
-
-2. **独立草稿列表不显示 Scheduled badge**：
-   - [articles.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/user/articles.tmpl) 中没有 `IsScheduled` 判断
-   - 即使草稿是定时发布的，作者在草稿列表中也看不到 "Scheduled" 标记
-
-3. **`includeFuture` 参数的真实含义**：
-   - 代码注释 TODO 承认：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L1302)
-     ```go
-     // TODO: change includeFuture to isOwner, since that's how it's used
-     ```
-   - 实际上所有调用点 `includeFuture` 都传入 `isCollOwner`
-
-### 6.2 未发布内容的渲染处理
-
-**判定条件**：`title == "" && content == ""`（即 `Gone` 状态）
-
-#### 独立文章（`handleViewPost`）
-
-处理逻辑在 [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L454-L467)：
-
-| 请求格式 | 处理方式 | HTTP 状态 |
-|---------|---------|----------|
-| JSON | 返回 `{"error": "Post was unpublished."}` | 200（带错误内容） |
-| RAW/纯文本 | 返回 "Post was unpublished." | 200（带错误内容） |
-| CSS | 返回空字符串 | 200 |
-| HTML | 返回 `ErrPostUnpublished` | 410 Gone |
-
-#### 集合文章（`viewCollectionPost`）
-
-处理逻辑在 [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L1594-L1597)：
-```go
-if p.Content == "" && p.Title.String == "" {
-    return impart.HTTPError{http.StatusGone, "Post was unpublished."}
-}
-```
-- **统一返回 410 Gone**，不区分请求格式
-
-### 6.3 受保护内容的渲染处理（分层权限链）
-
-#### A. 独立文章的 `protectDraft` 机制
-
-处理逻辑在 [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L444-L452, L519-L520)：
-
-```go
-// 查询到文章后，检查其所属集合（如果有）
-if found && collectionID.Valid {
-    collection, err := app.db.GetCollectionByID(collectionID.Int64)
-    protectDraft = collection.IsPrivate() || collection.IsProtected()
-}
-...
-// 最终渲染前检查
-if !page.IsOwner && protectDraft {
-    return ErrPostNotFound  // 404
-}
-```
-
-**设计意图**：独立文章本身是公开可访问的，但如果它**曾经属于**一个 Private/Protected 集合（`collection_id` 仍有值），则非作者会收到 404，避免通过独立 URL 绕过集合权限。
-
-#### B. 集合文章的完整权限链
-
-```
-用户访问 /{collection}/{slug}
-    ↓
-[collections.go:725-825] processCollectionPermissions() 前置检查
-    ├─ Private 集合 + 非作者 → 404 ErrCollectionNotFound（彻底隐藏）
-    ├─ Protected 集合 + 非作者
-    │   ├─ 作者被 silenced → 404
-    │   ├─ 已授权（Cookie）→ 继续执行
-    │   └─ 未授权 → 渲染密码输入页，返回 nil, nil（中断执行）
-    └─ 其他情况 → 返回 *Collection, nil
-    ↓
-[posts.go:1523-1533] viewCollectionPost() 文章级二次检查
-    ├─ Private 集合 + 非作者 → 404 ErrPostNotFound（双重保险）
-    ├─ Protected 集合 + 非作者
-    │   ├─ 作者被 silenced → 404
-    │   └─ 未授权 → 302 重定向到集合主页 ?g=slug
-    ├─ 作者被 silenced + 非作者/非管理员 → 404
-    └─ title=="" && content=="" → 410 Gone
-```
-
-#### C. 密码授权机制
-
-定义在 [collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/collections.go#L1415-L1422) `isAuthorizedForCollection()`：
-
-```go
-func isAuthorizedForCollection(app *App, alias string, r *http.Request) bool {
-    session, err := app.sessionStore.Get(r, blogPassCookieName)
-    if err == nil {
-        _, authd = session.Values[alias]
-    }
-    return authd
-}
-```
-
-- 授权状态存储在 `blogPassCookieName` 的 Session Cookie 中
-- 每个集合独立授权（`session.Values[alias]` 以集合别名为 key）
-- 登出：[collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/collections.go#L1424-L1438) `logOutCollection()` 删除对应 key
-
-#### D. 未授权时的渲染：密码输入页
-
-当 Protected 集合未授权时，在 [collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/collections.go#L790-L821) 渲染：
-
-```go
-p := struct {
-    page.StaticPage
-    *CollectionObj
-    Username string
-    Next     string    // 来自 ?g=slug，登录成功后跳转
-    Flashes  []template.HTML
-}{ ... }
-templates["password-collection"].ExecuteTemplate(w, "password-collection", p)
-return nil, nil  // 不继续执行后续文章查询
-```
-
-#### E. 列表页的受保护处理
-
-| 集合类型 | 非作者访问 | 渲染结果 |
-|---------|-----------|---------|
-| Private | 是 | 404 ErrCollectionNotFound（不暴露存在） |
-| Protected + 未授权 | 是 | 密码输入页（看不到文章） |
-| Protected + 已授权 | 是 | 正常文章列表（非作者仍看不到定时文章） |
-
-### 6.4 三种渲染入口
-
-#### A. 独立文章页面 (handleViewPost)
-
-路由：`/{post}` → [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L314-L544)
-
-权限与保护逻辑（按顺序）：
-1. 独立文章直接查询 `posts` 表，不通过集合
-2. 若所属集合是 `Private`/`Protected` → 非作者返回 404（`protectDraft`）
-3. `title == "" && content == ""` → 已取消发布，返回 `ErrPostUnpublished` (410)
-4. 作者被 silenced（禁言）且访问者不是作者 → 返回 404
-5. 非作者 + 受保护集合 → 返回 404
-
-模板：`templates/post.tmpl`，传入结构含 `IsOwner` 字段控制编辑按钮。
-
-#### B. 集合文章页面 (viewCollectionPost)
-
-路由：`/{collection}/{slug}` → [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go#L1465-L1702)
-
-集合权限检查（先于文章查询）见 [collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/collections.go#L725-L825) `processCollectionPermissions()`：
-- `IsPrivate()` + 非作者 → `ErrCollectionNotFound`（彻底隐藏存在）
-- `IsProtected()` → 检查 Session Cookie 中的授权，未授权则渲染密码输入页
-
-文章状态检查：
-- `content == "" && title == ""` → 410 Gone
-- silenced 作者 + 非作者/非管理员 → 404
-- 定时发布文章（`created > NOW()`）：仅作者可见（通过 `GetPosts` 的 `includeFuture` 参数控制）
-
-#### C. 集合文章列表 (handleViewCollection)
-
-文章列表查询：[database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go#L1303-L1369) `GetPosts()`
-
-```sql
-WHERE collection_id = ? 
-  AND pinned_position IS NULL
-  AND created <= NOW()   -- 非作者时加此条件（includeFuture=false）
-ORDER BY created DESC    -- blog 格式；novel 格式为 ASC
-```
-
-关键：`includeFuture` 传入 `isCollOwner`，因此作者能看到未到时间的定时文章。
-
-### 6.5 Markdown 渲染管道
-
-核心函数：[postrender.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/postrender.go)
-
-渲染时机：
-1. **列表视图**（博客首页）：`formatContent(cfg, c, isOwner, false)`
-   - 遇到 `<!--more-->` → 生成 `HTMLExcerpt` 截断
-   - 遇到 `<!--paid-->` + 非所有者 → 截断并显示 Coil 会员提示
-2. **详情页**：`formatContent(cfg, c, isOwner, true)`
-   - 显示全文，但付费内容仍按权限截断
-3. **签名追加**：`augmentContent()` → 若集合设置 `Signature` 且无 `<!--nosig-->`，则在正文末尾追加
-
-Markdown → HTML 过程见 [postrender.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/postrender.go#L146-L183) `applyMarkdownSpecial()`：
-- blackfriday 解析（表格、围栏代码、自动链接、删除线、标题 ID）
-- 标签链接替换：`#tag` → `<a href="/{coll}/tag:tag">`
-- @提及替换：`@user@host` → `/@/user@host` 链接
-- bluemonday 白名单过滤 XSS
-- YouTube 自动播放禁用
-
-### 6.6 渲染控制字段
-
-| 字段/标记 | 效果 |
-|-----------|------|
-| `Font` | `norm`=衬线, `sans`=无衬线, `wrap`=等号宽, `code`=原始代码 |
-| `Language` | 影响 `slug` 生语言、日期本地化 |
-| `RTL` | True 时设置 `dir="rtl"` |
-| `<!--more-->` | 列表页截断点，详情页中移除 |
-| `<!--paid-->` | 付费内容截断点（需集合设置 Monetization） |
-| `<!--nosig-->` | 不追加集合签名 |
-| `<!--emailsub-->` | 渲染为邮件订阅表单 |
+集合文章的处理更"干脆"——不管什么格式统一 410。独立文章则对机器可读格式做了妥协，返回 200 带错误信息，可能是为了兼容早期 API 客户端。
 
 ---
 
 ## 七、关键文件索引
 
-| 文件 | 主要职责 |
-|------|----------|
-| [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go) | 文章 HTTP 处理、查看、创建、更新、删除 |
-| [pad.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/pad.go) | 编辑器页面、元数据编辑页面 |
-| [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go) | 所有 DB 操作：CreatePost/UpdateOwnedPost/ClaimPosts/DispersePosts/GetPosts |
-| [collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/collections.go) | 集合可见性常量、权限校验、集合页面 |
-| [postrender.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/postrender.go) | Markdown 渲染、内容增强、摘要生成 |
-| [routes.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/routes.go) | 所有 URL 路由定义 |
-| [handle.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/handle.go) | HTTP Handler 包装、错误处理、用户鉴权 |
-| [static/js/postactions.js](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/static/js/postactions.js) | 前端：文章移动（发布/取消发布）AJAX 操作 |
-| [templates/pad.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/pad.tmpl) | 编辑器模板含本地草稿保存 JS |
-| [templates/include/posts.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/include/posts.tmpl) | 文章列表渲染、"移动到草稿" UI、Scheduled badge |
-| [templates/user/articles.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/user/articles.tmpl) | 独立草稿列表页模板、load more 分页 JS |
-| [templates/collection-post.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/collection-post.tmpl) | 集合文章详情页、Scheduled badge |
-| [templates/collection-archive.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/collection-archive.tmpl) | 集合归档页、[Scheduled] 文本标记 |
-| [schema.sql](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/schema.sql) | 数据库表结构：posts 表字段定义 |
+| 文件 | 核心作用 |
+|------|---------|
+| [posts.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/posts.go) | 文章 HTTP 层：查看、创建、更新、Claim、Disperse；`IsScheduled()` 判定；`getRawPost` / `getRawCollectionPost` |
+| [database.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/database.go) | DB 层：`CreatePost` / `UpdateOwnedPost` / `ClaimPosts` / `DispersePosts` / `GetPosts`（有 includeFuture）/ `GetPost`（无时间过滤）/ `GetAnonymousPosts` |
+| [collections.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/collections.go) | 集合可见性常量、`processCollectionPermissions`（集合级权限）、`isAuthorizedForCollection`（密码授权） |
+| [pad.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/pad.go) | `handleViewPad`：编辑器加载，两种编辑入口的 owner 校验都在这里 |
+| [account.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/account.go) | `viewArticles`（独立草稿列表页）、`viewMyPostsAPI`（草稿列表 API） |
+| [postrender.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/postrender.go) | Markdown 渲染管道、`formatContent`（paid/more 截断、列表 vs 详情差异）、`augmentContent`（签名追加） |
+| [routes.go](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/routes.go) | 路由定义：草稿 `/d/` 前缀区分、集合文章与独立文章 URL 映射 |
+| [templates/user/articles.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/user/articles.tmpl) | 独立草稿列表模板（无 Scheduled 判断） |
+| [templates/include/posts.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/include/posts.tmpl) | 集合文章列表模板（有 Scheduled badge） |
+| [templates/collection-post.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/collection-post.tmpl) | 集合文章详情页（有 Scheduled badge） |
+| [templates/collection-archive.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/collection-archive.tmpl) | 集合归档页（`[Scheduled]` 文本标记） |
+| [templates/pad.tmpl](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/templates/pad.tmpl) | 编辑器模板（本地草稿 localStorage、发布按钮逻辑） |
+| [static/js/postactions.js](file:///d:/fz/0601-1/solo-dogfeeding/code/31-writefreely/static/js/postactions.js) | 前端发布/取消发布：`move()` / `multiMove()` 调 collect / disperse 接口 |
