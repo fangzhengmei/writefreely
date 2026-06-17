@@ -94,7 +94,7 @@ if coll != nil && !app.cfg.App.Private && app.cfg.App.Federation {
 - `deleteFederatedPost` 函数**内部没有任何前置检查**（没有检查私有、没有检查集合可见性），只要调用了就会尝试投递 Delete 活动
 - 不存在"未来文章"概念（删除即删除）
 
-**结论**：删除入口的防守最薄弱，函数内部完全没有二次检查。
+**结论**：删除入口的防守最薄弱，函数内部完全没有二次检查。完整链路分析见 **1.7 删除活动完整链路**。
 
 #### 1.2.4 导入文章（入口最松 → 未来文章直接投出，私有实例靠内部兜底）
 
@@ -237,6 +237,133 @@ for _, tag := range na.Tag {
 - 直接发送到被提及用户的个人收件箱
 - 不使用共享收件箱
 - 找不到远程用户时跳过（不重试）
+
+### 1.7 删除活动完整链路
+
+删除活动走独立的 `deleteFederatedPost` 函数，链路与 `federatePost` 有显著差异。以下从**关注记录入库**、**删除取收件箱**、**为什么没有可见性检查**三个维度展开。
+
+#### 1.7.1 远程关注记录怎么进入
+
+远程用户的关注关系通过 **收件箱接收 Follow 活动** 建立，完整流程在 [activitypub.go:317-730](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/activitypub.go#L317-L730)：
+
+```
+远程实例 → POST /api/collections/{alias}/inbox
+    ↓
+handleFetchCollectionInbox()
+    ├─ 检查集合是否存在（GetCollection/ByID）
+    ├─ 检查集合所有者是否被 silenced（被静默则返回 404）
+    ├─ **不检查集合可见性**（private/protected 集合也能收 Follow）
+    ├─ 解析 Activity 并触发 FollowCallback
+    │      ├─ isFollow = true
+    │      ├─ 构造 Accept 活动
+    │      ├─ getActor() 获取远程用户信息
+    │      └─ 同步返回 200 OK（先响应，再处理）
+    └─ 异步 goroutine（2 秒延迟后）
+            ├─ 发送 Accept 到远程用户 inbox
+            └─ 如果 Accept 发送成功：
+                ├─ 若远程用户不存在 → INSERT INTO remoteusers（actor_id, inbox, shared_inbox, url）
+                ├─ 若首次见 → INSERT INTO remoteuserkeys（public_key）
+                └─ INSERT INTO remotefollows（collection_id, remote_user_id, created）
+```
+
+涉及两张核心表：
+
+| 表名 | 关键字段 | 说明 |
+|------|----------|------|
+| `remoteusers` | `id`, `actor_id`, `inbox`, `shared_inbox`, `url` | 所有已知远程用户的元信息，`actor_id` 唯一 |
+| `remotefollows` | `collection_id`, `remote_user_id`, `created` | 复合主键，记录某集合被哪些远程用户关注 |
+
+**关键注意**：
+- `remotefollows` 表**没有冗余保存集合当时的可见性**。只存 `collection_id` 和 `remote_user_id`。
+- **入库时不检查集合可见性**。inbox 入口只检查集合存在和所有者未被静默，不检查 `Visibility`。理论上 private/protected 集合也能被远程用户关注并建立记录（虽然 ActivityPub 发现阶段可能已经挡住了）。
+
+#### 1.7.2 删除时怎样取收件箱
+
+`deleteFederatedPost` 在 [activitypub.go:851-894](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/activitypub.go#L851-L894)，取收件箱流程：
+
+```go
+func deleteFederatedPost(app *App, p *PublicPost, collID int64) error {
+    // 没有任何前置检查，直接开始
+
+    p.Collection.ID = collID
+    followers, err := app.db.GetAPFollowers(&p.Collection.Collection)
+    // ↑ 只用到了 c.ID，其他 Collection 字段不关心
+```
+
+`GetAPFollowers` 在 [database.go:1557-1577](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/database.go#L1557-L1577)，执行 SQL：
+
+```sql
+SELECT actor_id, inbox, shared_inbox, f.created
+FROM remotefollows f
+INNER JOIN remoteusers u ON f.remote_user_id = u.id
+WHERE collection_id = ?
+ORDER BY created DESC
+```
+
+拿到 `[]RemoteUser` 后，与 `federatePost` 一样按收件箱分组：
+
+```go
+inboxes := map[string][]string{}
+for _, f := range *followers {
+    inbox := f.SharedInbox
+    if inbox == "" {
+        inbox = f.Inbox
+    }
+    inboxes[inbox] = append(inboxes[inbox], f.ActorID)
+}
+```
+
+然后构造 Delete 活动逐收件箱发送：
+
+```go
+for si, instFolls := range inboxes {
+    na.CC = instFolls
+    da := activitystreams.NewDeleteActivity(na)
+    da.ID += "#Delete"  // 特殊后缀，兼容 Pleroma
+    err = makeActivityPost(app.cfg.App.Host, actor, si, da)
+}
+```
+
+**取件箱逻辑小结**：
+1. 用 `collID` 查 `remotefollows` → `remoteusers` JOIN，拿到所有关注者
+2. 与创建/更新一样按 shared_inbox 优先分组去重
+3. 没有过滤逻辑（不排除已失效的 inbox、不重试失败地址）
+
+#### 1.7.3 为什么不再走集合可见性兜底
+
+`deleteFederatedPost` 不像 `federatePost` 那样检查 `Collection.Visibility`，原因有设计合理性和实现疏漏两方面：
+
+**原因 1：语义合理性 —— Delete 是撤回已发内容**
+
+Create/Update 与 Delete 的语义不同：
+- **Create/Update**：在向外推送**新内容**。如果集合后来变成 private/protected，就不该再向外推新内容了。
+- **Delete**：在**撤回**之前已经推送出去的内容。那篇文章在集合是 public 时已经发出去了，远程实例可能已经缓存、展示、传播。即使集合后来变 private，也应该通知远程实例把之前收到的那篇文章删掉，否则会出现"源站已删但远端还在展示"的不一致。
+
+**原因 2：入库时就不检查可见性 —— 没有历史记录可查**
+
+如 1.7.1 所述，`remotefollows` 入库时不记录集合当时的 `Visibility`，表结构里也没有冗余字段。如果删除时想判断"这批关注是在集合公开时加的还是变私有后加的"，根本查不到。
+
+**原因 3：可能的实现疏漏 —— 与入口检查不一致**
+
+删除入口 [posts.go:943-945](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L943-L943) 是有 `!app.cfg.App.Private` 和 `coll != nil` 检查的：
+
+```go
+if coll != nil && !app.cfg.App.Private && app.cfg.App.Federation {
+    go deleteFederatedPost(app, pp, collID.Int64)
+}
+```
+
+但函数内部把实例私有检查和集合可见性检查都丢了。这可能是**疏漏**——如果实例在删除前被管理员改为私有，入口检查能挡住，但如果删除的那一瞬间集合从 public 改成了 private，入口检查过了但函数内部该挡不挡。
+
+**两类"后来变私有"的场景对比**：
+
+| 场景 | 入口检查 | 函数内部检查 | 结果 |
+|------|----------|--------------|------|
+| 实例先改私有，再删文章 | `!app.cfg.App.Private` 挡住 | 无需到函数 | ✓ 不投递 |
+| 删文章的瞬间集合从 public 改 private | `coll != nil` 已过 | 函数内部不检查 Visibility | ✗ 投递了 |
+| 实例在 goroutine 调度期间改私有 | 入口检查过了 | `deleteFederatedPost` 不检查实例私有 | ✗ 投递了 |
+
+对比 `federatePost` 有实例私有兜底检查，`deleteFederatedPost` 缺失的这两项检查（实例私有、集合可见性）更像是不一致的疏漏，而非刻意设计。
 
 ---
 
@@ -486,15 +613,20 @@ handleFetchCollectionInbox()
 | **终态判定** | 无（失败即终态，仅记录日志） |
 | **HTTP 状态码** | 不检查，4xx/5xx 均视为"成功"返回 nil |
 | **失败处理** | 仅网络层错误记 log.Error，4xx/5xx 静默忽略 |
+| **关注记录入库** | 收件箱收 Follow → 2 秒延迟发 Accept → 入库 `remoteusers` + `remotefollows` |
+| **删除取收件箱** | `GetAPFollowers` JOIN 两表按 collection_id 查，shared_inbox 优先分组去重 |
+| **删除无可见性检查** | 语义合理性（撤回已发内容）+ 入库无历史记录 + 可能的实现疏漏 |
 
 ### 5.2 设计走向观察
 
-从现有代码（尤其是邮件发布队列的设计）可以观察到以下走向：
+从现有代码（尤其是邮件发布队列和删除链路的设计）可以观察到以下走向：
 
 1. **队列模式已有先例**：邮件发布使用了基于数据库的 `publishjobs` 队列，说明项目具备队列化异步处理的基础设计模式
 2. **延迟执行而非重试**：邮件队列只有固定延迟，没有重试梯度，说明当前设计更倾向于"延迟执行"而非"失败重试"
 3. **时间窗口机制**：`GetJobsToRun` 的时间窗口设计（delay 到 delay+5 分钟）暗示了简单的"错过即丢弃"哲学
 4. **联邦投递更轻量**：联邦投递直接使用 goroutine，没有数据库持久化，说明对可靠性要求低于邮件发布
+5. **删除链路特殊处理**：Create/Update 走 `federatePost` 有完整防守，Delete 走独立的 `deleteFederatedPost` 故意省略了可见性检查，体现对"撤回已发内容"的语义优先级高于"新内容保密"
+6. **设计不一致性**：删除入口有实例私有检查，但 `deleteFederatedPost` 内部没有，与 `federatePost` 的防守层次不一致，可能是实现疏漏
 
 ### 5.3 相关文件索引
 
@@ -504,7 +636,8 @@ handleFetchCollectionInbox()
 | [posts.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go) | 文章发布/更新/删除/认领入口，触发联邦投递 |
 | [account_import.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/account_import.go) | 文章批量导入入口，触发联邦投递 |
 | [jobs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/jobs.go) | 邮件发布队列消费逻辑 |
-| [database.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/database.go) | `publishjobs` 表的数据库操作（InsertJob、GetJobsToRun、DeleteJob 等） |
 | [email.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/email.go) | 邮件发送逻辑，`emailSendDelay` 常量 |
+| [database.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/database.go) | `publishjobs` 表的数据库操作，以及 `GetAPFollowers` 查关注者 |
 | [database_activitypub.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/database_activitypub.go) | 联邦相关数据库操作（远程用户添加） |
+| [schema.sql](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/schema.sql) | 数据库 schema，含 `remotefollows`、`remoteusers` 表定义 |
 | [migrations/v13.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/migrations/v13.go) | `publishjobs` 表创建迁移 |
