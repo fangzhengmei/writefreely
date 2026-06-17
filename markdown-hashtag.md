@@ -174,7 +174,7 @@ func (db *datastore) GetAllPostsTaggedIDs(c *Collection, tag string, includeFutu
             "SELECT id FROM posts WHERE collection_id = ? AND LOWER(content) regexp ? ...",
             collID, `.*#`+strings.ToLower(tag)+`\b.*`)
     } else {
-        // MySQL 使用 [[:>:]] 或 \b 词边界（取决于 MySQL 版本）
+        // MySQL 硬编码 [[:>:]]（⚠️ BUG：未使用 useSpencerRegex，8.0.4+ 会报错，见第 10.1 节）
         rows, err = db.Query(
             "SELECT id FROM posts WHERE collection_id = ? AND LOWER(content) RLIKE ? ...",
             collID, "#"+strings.ToLower(tag)+"[[:>:]]")
@@ -564,25 +564,47 @@ func (p *Post) HasTag(tag string) bool {
 }
 ```
 
-#### 边界正则分析：
+#### 边界正则分析（已校准）：
 
-`(?:[[:punct:]]|\s|\z)` 表示 hashtag 后面必须跟：
-- `[[:punct:]]` - 任意标点符号
+`(?:[[:punct:]]|\s|\z)` 表示 hashtag 后面必须跟以下三者之一：
+- `[[:punct:]]` - ASCII 标点（Go RE2 中范围为 `[\x21-\x2f\x3a-\x40\x5b-\x60\x7b-\x7e]`，**注意包含下划线 `_` (\x5f)**，这是 POSIX 历史遗留）
 - `\s` - 任意空白字符
 - `\z` - 字符串结束
 
-#### 与数据库查询的边界差异：
+#### 与数据库查询的边界差异（逐字符校准，7 示例对齐）：
 
-| 场景 | 边界规则 | 匹配 `#go-test` | 匹配 `#go.test` | 匹配 `#go` 在行尾 |
-|------|---------|----------------|----------------|------------------|
-| 数据库 `\b` (ICU) | 词边界 | ✅ | ✅ | ✅ |
-| 数据库 `[[:>:]]` (Spencer) | 右词边界 | ✅ | ❌ `.` 不是词字符 | ✅ |
-| HasTag `(?:[[:punct:]]\|\s\|\z)` | 标点/空白/行尾 | ✅ `-` 是标点 | ✅ `.` 是标点 | ✅ `\z` |
+关键事实：数据库的 `\b`（RE2/ICU）和 `[[:>:]]`（Spencer）**都把单词字符定义为 `[0-9A-Za-z_]`**，因此 `-`、`.` 都是非词字符 → 都构成边界，**两者在 `-`、`.` 上行为完全一致**。之前"`. ` 不是词字符 → 不匹配"的推理是**反向的**：正因为 `.` 是非词字符，`o→.` 才构成右边界，所以 `[[:>:]]` **是匹配** `#go.test` 的。
 
-**⚠️ 差异风险**：三种边界规则定义不完全一致，可能导致：
-- 数据库查询返回的文章，Reader 内存过滤可能排除
-- Reader 内存过滤包含的文章，数据库查询可能不返回
-- 典型案例：`#go.test` 在 MySQL 5.x 上数据库查询不匹配，但 HasTag 匹配
+真正产生差异的字符是**下划线 `_`**：它在数据库里是"词字符"（`\w` 的一部分，`\w` = `[0-9A-Za-z_]`，含 0x5f），但在 Go RE2 的 `[[:punct:]]` 里它**也是标点**。`_` 同时属于 `\w` 和 `[[:punct:]]` 是 POSIX 的历史遗留。
+
+以搜索 tag=`go` 为例，7 个示例在各层的匹配行为：
+
+| 内容 | SQLite `.*#go\b.*` | MySQL5 `#go[[:>:]]` | MySQL8 `#go\b` | HasTag `[[:punct:]]\|\s\|\z` | Blackfriday 链接 | tags.Extract |
+|------|------|------|------|------|------|------|
+| `#go world` | ✅ | ✅ | ✅ | ✅ `\s` | ✅ "go" | "go" |
+| `#go-test` | ✅ | ✅ | ✅ | ✅ `-` punct | ✅ "go" | "go" |
+| `#go.test` | ✅ | ✅ | ✅ | ✅ `.` punct | ✅ "go" | "go" |
+| `#go_test` | ❌ `_`是词字符 | ❌ | ❌ | ✅ `_` 是 punct | ✅ "go" | "go" |
+| `#golang` | ❌ | ❌ | ❌ | ❌ | ✅ "golang" | "golang" |
+| `#go`（行尾/结尾） | ✅ | ✅ | ✅ | ✅ `\z` | ✅ "go" | "go" |
+| `#123`（纯数字） | — | — | — | — | ❌ 不链接 | ❌ |
+
+**Blackfriday 正则**（来自 [saturday inline.go](https://raw.githubusercontent.com/writeas/saturday/master/inline.go)）：
+
+```go
+hashRe = regexp.MustCompile(`#(([\d]+[\p{L}\p{M}]+[\p{L}\p{M}\d]*)|([\p{L}\p{M}][\p{L}\p{M}\d]*))`)
+```
+
+- 标签字符类是 `[\p{L}\p{M}\d]`（Unicode 字母+标记+数字），**不含 `_`、`-`、`.`**。
+- 所以 `#go-test`、`#go.test`、`#go_test` 在渲染时都只取 `go` 作为链接目标 → 均链接到 `/tag:go`。
+- 纯数字 `#123` 不匹配（两个分支都要求至少有一个字母 `\p{L}\p{M}`）。
+
+**`_` 是唯一真正产生"数据库层 vs 应用层"过滤差异的字符**（详见第 12、13 节）：
+- 数据库一致地把 `_` 当词字符 → `#go_test` 被视为标签 `go_test`，搜 `go` 时**不命中**（这是正确行为，标签本就是 `go_test`）。
+- 但 Blackfriday 和 HasTag 都把 `_` 当终止符/边界 → 它们认为 `#go_test` 关联的是标签 `go`。
+- 结果：文章里渲染出的链接指向 `/tag:go`，而 `/tag:go` 这个数据库查询的标签页却**不包含**这篇文章（指向了一个"不含自己"的页面）；Reader `/read/t/go` 又会包含它。
+
+注意：`-`、`.` **不会**产生此类差异，因为它们在所有层都一致地被当作终止符/边界。
 
 ---
 
