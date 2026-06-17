@@ -12,7 +12,7 @@ WriteFreely 的联邦投递（ActivityPub）当前采用 **fire-and-forget（发
 
 ### 1.1 触发场景
 
-联邦投递在以下四种场景下被触发，均以 goroutine 异步方式执行：
+联邦投递在以下五种场景下被触发，均以 goroutine 异步方式执行：
 
 | 场景 | 代码位置 | 说明 |
 |------|----------|------|
@@ -20,6 +20,7 @@ WriteFreely 的联邦投递（ActivityPub）当前采用 **fire-and-forget（发
 | 更新文章 | [posts.go:805](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L805-L805) | `go federatePost(app, pRes, pRes.Collection.ID, true)` |
 | 删除文章 | [posts.go:944](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L944-L944) | `go deleteFederatedPost(app, pp, collID.Int64)` |
 | 导入文章 | [account_import.go:166](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/account_import.go#L166-L166) | `go federatePost(...)` |
+| 认领文章 | [posts.go:1002](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L1002-L1002) | `go federatePost(app, pRes.Post, pRes.Post.Collection.ID, false)` |
 
 ### 1.2 前置检查条件
 
@@ -40,6 +41,30 @@ if newPost.Collection != nil {
 2. **应用非私有**：`!app.cfg.App.Private` — 私有实例不进行联邦投递
 3. **联邦功能启用**：`app.cfg.App.Federation` — 配置中开启了联邦功能
 4. **非未来文章**：`!newPost.Created.After(time.Now())` — 创建时间晚于当前时间的文章不立即投递
+
+#### 认领文章的触发点检查（posts.go:995-1003）
+
+认领文章（Claim）是独立于发布/更新的第五个触发场景。用户将一篇散落在个人名下、尚未归属任何集合的文章"认领"到某个集合后，该文章变为集合内容，需要向联邦推送 Create 活动。
+
+```go
+for _, pRes := range *res {
+    if pRes.Code != http.StatusOK {
+        continue
+    }
+    if !app.cfg.App.Private && app.cfg.App.Federation {
+        if !pRes.Post.Created.After(time.Now()) {
+            pRes.Post.Collection.hostName = app.cfg.App.Host
+            go federatePost(app, pRes.Post, pRes.Post.Collection.ID, false)
+        }
+    }
+}
+```
+
+条件拆解：
+1. **认领成功**：`pRes.Code == http.StatusOK` — 只有认领操作成功的文章才触发投递，失败或冲突的跳过
+2. **应用非私有 + 联邦启用**：与发布场景相同的全局检查
+3. **非未来文章**：与发布场景相同，未来文章不立即投递
+4. **isUpdate = false**：认领相当于首次发布，使用 Create 活动而非 Update
 
 #### 函数内部检查（federatePost）
 
@@ -142,7 +167,41 @@ if err != nil {
 
 仅记录错误日志，不进行任何重试。
 
-### 2.2 HTTP 客户端超时配置
+### 2.2 远端返回 4xx/5xx 不被视为错误
+
+`makeActivityPost` 的关键行为：**只要 `activityPubClient().Do(r)` 没有返回 Go 层面的 `error`，函数就返回 `nil`（即"成功"）**，完全不检查 HTTP 响应状态码。
+
+```go
+resp, err := activityPubClient().Do(r)
+if err != nil {
+    return err          // 只有网络层/超时错误才会走到这里
+}
+// ... 关闭 body、读取 body ...
+return nil              // 无论 resp.StatusCode 是 200、403、410 还是 500，都走这里
+```
+
+这意味着以下远端响应**不会**被当作错误返回：
+
+| 远端响应 | 是否被当作错误 | 说明 |
+|----------|----------------|------|
+| `200 OK` | 否 | 正常投递成功 |
+| `202 Accepted` | 否 | Mastodon 等异步处理返回 |
+| `400 Bad Request` | 否 | 请求格式问题，但调用方不知情 |
+| `401 Unauthorized` | 否 | 签名问题，但调用方不知情 |
+| `403 Forbidden` | 否 | 被远端拒绝，但调用方不知情 |
+| `404 Not Found` | 否 | 收件箱不存在，但调用方不知情 |
+| `410 Gone` | 否 | 收件箱已删除，但调用方不知情 |
+| `500 Internal Server Error` | 否 | 远端服务器故障，但调用方不知情 |
+| `503 Service Unavailable` | 否 | 远端暂时不可用，但调用方不知情 |
+
+**后果**：
+- 远端返回 4xx（如 410 Gone 表示实例已关停）时，调用方以为投递成功，不会触发任何重试或记录
+- 远端返回 5xx（如 503 临时不可用）时，本应属于可重试的瞬态错误，但也被当作成功丢弃
+- 只有 Go 的 `http.Client.Do()` 抛出 `error`（如 DNS 解析失败、连接拒绝、TLS 握手失败、15 秒超时）才会被上层捕获并记入日志
+
+在 debug 模式下，状态码和响应体会被打印到日志（[activitypub.go:791-794](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/activitypub.go#L791-L794)），但生产环境默认不输出，且不参与任何逻辑判断。
+
+### 2.3 HTTP 客户端超时配置
 
 虽然没有重试，但 HTTP 客户端有超时设置：
 
@@ -157,7 +216,7 @@ func activityPubClient() *http.Client {
 - 请求超时：15 秒
 - 超时后返回错误，终止本次投递
 
-### 2.3 Follow/Unfollow 的初始延迟
+### 2.4 Follow/Unfollow 的初始延迟
 
 在处理收到的 Follow/Unfollow 活动时，异步回复 Accept 活动有 2 秒延迟：
 
@@ -179,7 +238,7 @@ go func() {
 - 给远程服务器一些准备时间
 - **但这不是重试退避，只是初始延迟**
 
-### 2.4 参考：邮件发布的延迟队列
+### 2.5 参考：邮件发布的延迟队列
 
 作为对比，邮件发布（email publishing）有一个基于数据库的延迟队列机制，位于 `publishjobs` 表：
 
@@ -217,15 +276,19 @@ go func() {
 
 `makeActivityPost` 可能返回的错误类型：
 
-| 错误场景 | 处理方式 |
-|----------|----------|
-| JSON 序列化失败 | 直接返回错误，终止 |
-| 私钥解码失败 | 直接返回错误，终止 |
-| 签名失败 | 记录错误日志，但**继续发送**（无签名请求） |
-| HTTP 请求失败（网络错误、超时等） | 直接返回错误，终止 |
-| 响应读取失败 | 直接返回错误，终止 |
+| 错误场景 | 是否返回 error | 处理方式 |
+|----------|----------------|----------|
+| JSON 序列化失败 | 是 | 直接返回错误，终止 |
+| 私钥解码失败 | 是 | 直接返回错误，终止 |
+| 签名失败 | 否 | 记录错误日志，但**继续发送**（无签名请求） |
+| HTTP 请求失败（网络错误、超时等） | 是 | 直接返回错误，终止 |
+| 响应读取失败 | 是 | 直接返回错误，终止 |
+| 远端返回 4xx（400/401/403/404/410 等） | **否** | `return nil`，调用方以为成功 |
+| 远端返回 5xx（500/502/503 等） | **否** | `return nil`，调用方以为成功 |
 
-注意：签名失败不会阻止请求发送，只是会发送没有签名的请求。
+注意：
+- 签名失败不会阻止请求发送，只是会发送没有签名的请求
+- **远端返回任何 HTTP 状态码都不会产生 Go error**，只有网络层/传输层错误才会。这是当前实现中最大的盲区：410 Gone（实例已关停）等永久性失败和 503 Service Unavailable（临时不可用）等瞬态失败都被静默忽略
 
 ### 3.3 参考：邮件发布的终态处理
 
@@ -261,7 +324,7 @@ func runJobs(app *App, jobs []*PostJob, reqColl bool) error {
 ### 4.1 联邦投递主流程
 
 ```
-发布/更新/删除文章
+发布/更新/删除/认领文章
     ↓
 posts.go 中检查触发条件
     ↓
@@ -278,7 +341,8 @@ federatePost() / deleteFederatedPost()
             ├─ 构造 HTTP 请求
             ├─ 签名
             ├─ 发送（15 秒超时）
-            └─ 返回结果（失败仅 log.Error）
+            ├─ 网络层错误 → return err → 上层 log.Error → 终止
+            └─ 拿到响应（不管 200/4xx/5xx）→ return nil → 上层无感知
 ```
 
 ### 4.2 收件箱处理异步流程
@@ -303,11 +367,12 @@ handleFetchCollectionInbox()
 | 维度 | 现状 |
 |------|------|
 | **入队方式** | goroutine 异步触发，无持久化队列 |
-| **入队条件** | 4 个触发场景 + 4 项前置检查 |
+| **入队条件** | 5 个触发场景 + 4 项前置检查 |
 | **重试机制** | 无，fire-and-forget |
 | **退避梯度** | 无（Follow 回复有 2 秒初始延迟，非重试退避） |
 | **终态判定** | 无（失败即终态，仅记录日志） |
-| **失败处理** | log.Error，不告警，不重试 |
+| **HTTP 状态码** | 不检查，4xx/5xx 均视为"成功"返回 nil |
+| **失败处理** | 仅网络层错误记 log.Error，4xx/5xx 静默忽略 |
 
 ### 5.2 设计走向观察
 
