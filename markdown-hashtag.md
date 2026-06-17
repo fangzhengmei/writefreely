@@ -672,20 +672,23 @@ pagePosts := coll.Format.PostsPerPage()
 coll.TotalPages = int(math.Ceil(float64(ttlPosts) / float64(pagePosts)))
 ```
 
-**受影响场景**：
+**按 MySQL 版本分类的影响（已校准）**：
 
-| MySQL 版本 | 计数查询语法 | 分页查询语法 | 一致性 | 总数准确性 |
-|-----------|-------------|-------------|--------|-----------|
-| 5.x | `[[:>:]]` | `[[:>:]]` | ✅ 一致 | ✅ 准确 |
-| 8.0.0-8.0.3 | `[[:>:]]` | `\b`（错误） | ❌ 不一致 | ❌ 可能不准确 |
-| 8.0.4+ | `[[:>:]]`（错误） | `\b` | ❌ 不一致 | ❌ 可能不准确 |
+| MySQL 版本 | 计数查询 GetAllPostsTaggedIDs | 分页查询 GetPostsTagged | TotalPages | 标签页列表 |
+|-----------|------|------|------|------|
+| 5.x | `#go[[:>:]]` Spencer ✅ | `#go[[:>:]]` Spencer ✅ | ✅ 准确 | ✅ 与计数一致 |
+| 8.0.0-8.0.3 | `#go[[:>:]]` Spencer ✅（计数正确） | `#go\b`：Spencer 把 `\b` 当退格符 0x08 → 几乎不匹配 | ✅ 准确（基于计数） | ❌ 几乎为空，与 TotalPages 不符 |
+| 8.0.4+ | `#go[[:>:]]`：ICU 不认识 → ERROR 3685 | 不会被调用（计数已抛错） | N/A（页面 HTTP 500） | N/A（页面 HTTP 500） |
 
-**风险场景示例**（MySQL 8.0.4+）：
-- 文章内容包含 `#golang` 和 `#go-test`
-- 搜索 `#go` 时：
-  - 计数查询使用 `#go[[:>:]]` → 匹配 `#go-test`（`-` 不是词字符），不匹配 `#golang`
-  - 分页查询使用 `#go\b` → 不匹配 `#go-test`（`.` 不是词边界），不匹配 `#golang`
-  - 结果：`TotalPages = ceil(1/10) = 1`，但第一页返回 0 篇文章
+**校准要点**：
+
+1. **MySQL 8.0.4+ 不是"计数与列表不一致"，而是整个标签页 500**：ICU 对 `[[:>:]]` 直接抛 `ERROR 3685`，[collections.go L1048-L1051](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/collections.go#L1048-L1051) 捕获后返回 `HTTP 500 "Couldn't retrieve tagged collection posts."`。TotalPages 根本不会计算，GetPostsTagged 也不会被调用。
+
+2. **旧版风险场景示例不成立**：原分析中"`#go-test` 在计数匹配但列表不匹配"的场景不存在——`-`、`.` 在 `\b` 和 `[[:>:]]` 下都是非词字符，两者行为**完全一致**，不产生差异。无论 MySQL 5.x 还是 8.0.4+，`#go-test` 和 `#go.test` 在计数和分页查询中的匹配结果都是一致的。
+
+3. **MySQL 8.0.0-8.0.3 才是真正的"TotalPages 与列表不一致"**：计数查询用硬编码 `[[:>:]]`（Spencer 认识，计数正确），分页查询用 `\b`（Spencer 不把 `\b` 当词边界，而当作退格符 0x08），导致 `TotalPages = ceil(N/10)` 正确但第 1 页返回 0 篇文章。
+
+4. **边界字符 `_` 不影响"TotalPages vs 列表"的内部一致性**：`#go_test` 在数据库层（`\b`/`[[:>:]]`）一致地把 `_` 当词字符 → 被判定为标签 `go_test`，所以计数和列表都排除它，两者一致。`_` 的影响体现在"应用层 vs 数据库层"的**跨层**不一致，见第 12.2 节。
 
 ### 12.2 对标签页列表的影响
 
@@ -695,8 +698,37 @@ coll.TotalPages = int(math.Ceil(float64(ttlPosts) / float64(pagePosts)))
 3. 每行 `p.extractData()` → 填充 `p.Tags`
 4. 每行 `p.formatContent()` → 渲染 HTML 链接
 
-**渲染后内容中的 hashtag 链接**：
-标签在文章内容中渲染为可点击链接的逻辑位于 [postrender.go L158-L171](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/postrender.go#L158-L171)，由 blackfriday + 正则替换实现，**不受数据库版本影响**。
+**列表查询的数据库版本差异**：
+- MySQL 5.x：计数和分页都用 `[[:>:]]`，列表与 TotalPages 一致且正确。
+- MySQL 8.0.0-8.0.3：计数用 `[[:>:]]`（正确），分页用 `\b`（被 Spencer 当退格符），导致列表几乎为空，与 TotalPages 不符。
+- MySQL 8.0.4+：计数查询先报错，根本到不了列表查询这一步，标签页直接 HTTP 500。
+
+**渲染后内容中的 hashtag 链接（与数据库版本无关）**：
+标签在文章内容中渲染为可点击链接的逻辑位于 [postrender.go L158-L171](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/postrender.go#L158-L171)，由 blackfriday `hashRe` + 占位符替换实现，**不受数据库版本影响**。但 blackfriday 的 `hashRe` 字符类是 `[\p{L}\p{M}\d]`（不含 `_`、`-`、`.`），因此 `#go-test`、`#go.test`、`#go_test` 渲染时都只取 `go` → 链接均指向 `/tag:go`。
+
+**`_` 字符造成的跨层不一致（真正影响"列表内容"的差异）**：
+
+**代码层面的根本原因**：
+1. **Blackfriday 渲染**（[saturday inline.go](https://raw.githubusercontent.com/writeas/saturday/master/inline.go)）：`hashRe = regexp.MustCompile(`#(([\d]+[\p{L}\p{M}]+[\p{L}\p{M}\d]*)|([\p{L}\p{M}][\p{L}\p{M}\d]*))`)`，标签字符类 `[\p{L}\p{M}\d]` **不含 `_`**，因此遇到 `_` 立即停止匹配。
+2. **数据库查询**（[database.go L1387/L1389/L1458](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/database.go#L1387-L1458)）：使用 `\b` 或 `[[:>:]]` 词边界，两者的"词字符"定义都是 `[0-9A-Za-z_]`，**含 `_`**，因此 `o→_` 不构成边界。
+3. **Reader HasTag**（[posts.go L290-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/posts.go#L290-L296)）：使用 `(?:[[:punct:]]|\s|\z)` 边界，Go RE2 中 `[[:punct:]]` **含 `_`**（POSIX 历史遗留），因此遇到 `_` 即认为是边界。
+
+以一篇文章内容为 `Hello #go_test world` 为例，各层判定：
+
+| 层 | 代码位置 | 对 `#go_test` 的判定 | 行为 |
+|----|---------|---------------------|------|
+| Blackfriday 渲染 | saturday `hashRe` | `_` 是终止符 → 标签名 `go` | 生成链接 `<a href="/tag:go">` |
+| tags.Extract / ActivityPub | [posts.go L1714-L1717](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/posts.go#L1714-L1717) | 同上 → `go` | 联邦输出的 tag 是 `go` |
+| 数据库计数/分页（任意 MySQL） | [database.go L1387/L1389/L1458](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/database.go#L1387-L1458) | `_` 是词字符 → 标签名 `go_test` | 搜 `go` 时 `o→_` **不**构成边界 → **不命中** |
+| Reader HasTag | [posts.go L290-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/posts.go#L290-L296) | `_` 属 `[[:punct:]]` → 是边界 | 搜 `go` 时**命中** |
+
+**后果（明确影响路径）**：
+1. **标签页总数**：TotalPages 不直接受影响（计数和列表都一致地排除它），但总数统计的是"标签 `go` 的文章数"，与用户从链接期望看到的内容不一致。
+2. **标签页列表**：文章里渲染出的链接 `/tag:go` 指向的标签页**不包含这篇文章**（数据库搜 `go` 不命中 `#go_test`）→ 死链接。
+3. **Reader 过滤**：Reader `/read/t/go` **包含**这篇文章（HasTag 命中），与 Collection 标签页 `/tag:go` **不一致**。
+4. **Markdown 链接**：链接目标错误，用户点击 `/tag:go` 看不到来源文章，只有 `/tag:go_test` 才能看到，但文章里没有指向 `/tag:go_test` 的链接。
+
+**`-` 和 `.` 不产生此类跨层问题**：它们在所有层都一致地被当作终止符/边界——在 blackfriday `hashRe` 中不在字符类内，在数据库 `\b`/`[[:>:]]` 中是非词字符，在 HasTag `[[:punct:]]` 中是标点。三者行为完全一致。
 
 ### 12.3 对链接渲染判断的影响
 
