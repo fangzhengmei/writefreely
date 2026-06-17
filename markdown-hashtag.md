@@ -448,3 +448,320 @@ db.GetPostsTagged()  [database.go L1420]
 3. **多协议支持**：同一套 Tags 数据同时支撑 HTML 微格式（`p-category`）、RSS Feed、ActivityPub 联邦协议
 4. **多层过滤**：数据库层（RLIKE）→ 应用层（extractData）→ 展示层（HTML 链接），每层有独立职责
 5. **URL 策略**：不同部署模式（Single User / Multi User / Chorus）使用不同的标签 URL 前缀，但通过统一的 `tagPrefix` 逻辑管理
+
+---
+
+## 十、标签查询实现机制深度分析
+
+### 10.1 计数查询：GetAllPostsTaggedIDs 的边界规则
+
+**位置**：[database.go L1371-L1414](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/database.go#L1371-L1414)
+
+#### 核心逻辑：
+
+```go
+func (db *datastore) GetAllPostsTaggedIDs(c *Collection, tag string, includeFuture bool) ([]string, error) {
+    // ...
+    if db.driverName == driverSQLite {
+        // SQLite: 完整行匹配 + \b 词边界
+        rows, err = db.Query(
+            "SELECT id FROM posts WHERE collection_id = ? AND LOWER(content) regexp ? ...",
+            collID, `.*#`+strings.ToLower(tag)+`\b.*`)  // L1387
+    } else {
+        // MySQL: 硬编码使用 [[:>:]] 词边界（⚠️ BUG：未考虑 useSpencerRegex）
+        rows, err = db.Query(
+            "SELECT id FROM posts WHERE collection_id = ? AND LOWER(content) RLIKE ? ...",
+            collID, "#"+strings.ToLower(tag)+"[[:>:]]")  // L1389
+    }
+}
+```
+
+#### 边界规则分析：
+
+| 数据库 | 正则模式 | 词边界 | 是否使用 useSpencerRegex |
+|--------|---------|--------|--------------------------|
+| SQLite | `.*#tag\b.*` | `\b` | N/A |
+| MySQL | `#tag[[:>:]]` | `[[:>:]]` | ❌ 硬编码，未使用 |
+
+**⚠️ 关键 Bug**：MySQL 分支硬编码使用 `[[:>:]]`，没有根据 `db.useSpencerRegex` 动态选择。这导致在 MySQL 8.0.4+ 上，计数查询使用的是旧的 Spencer 语法 `[[:>:]]`，而分页查询使用的是 ICU 语法 `\b`。
+
+#### 时间边界：
+
+```go
+timeCondition := ""
+if !includeFuture {
+    timeCondition = "AND created <= " + db.now()  // L1380-L1383
+}
+```
+
+- 非所有者访问时，排除未来发布的文章（`created <= NOW()`）
+- 所有者访问时，包含未来文章（用于预览）
+
+---
+
+### 10.2 分页查询：GetPostsTagged 的边界规则
+
+**位置**：[database.go L1420-L1487](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/database.go#L1420-L1487)
+
+#### 分页逻辑：
+
+```go
+pagePosts := cf.PostsPerPage()       // L1429
+start := page*pagePosts - pagePosts  // L1430
+if page == 0 {
+    start = 0
+    pagePosts = 1000                 // L1431-L1434: 特殊处理 page=0
+}
+
+limitStr := ""
+if page > 0 {
+    limitStr = fmt.Sprintf(" LIMIT %d, %d", start, pagePosts)  // L1436-L1439
+}
+```
+
+#### 分页边界规则：
+
+| page 值 | start | pagePosts | LIMIT 子句 | 用途 |
+|---------|-------|-----------|------------|------|
+| `page == 0` | `0` | `1000` | 无 | RSS Feed 等需要全部数据的场景 |
+| `page == 1` | `0` | `10`（默认） | `LIMIT 0, 10` | 第一页 |
+| `page == 2` | `10` | `10` | `LIMIT 10, 10` | 第二页 |
+| `page == N` | `(N-1)*10` | `10` | `LIMIT (N-1)*10, 10` | 第 N 页 |
+
+#### 词边界处理（已正确实现）：
+
+```go
+var boundaryRegex string
+if db.useSpencerRegex {
+    // MySQL < 8.0.4: Henry Spencer 实现
+    boundaryRegex = "[[:>:]]"  // L1453
+} else {
+    // MySQL >= 8.0.4: ICU 实现
+    boundaryRegex = "\\b"      // L1456
+}
+rows, err = db.Query("SELECT ... LOWER(content) RLIKE ? ...",
+    collID, "#"+strings.ToLower(tag)+boundaryRegex)  // L1458
+```
+
+✅ **正确实现**：分页查询正确使用了 `useSpencerRegex` 标志。
+
+---
+
+### 10.3 Reader 内存过滤：HasTag 的边界规则
+
+**位置**：[posts.go L290-L296](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/posts.go#L290-L296)
+
+```go
+func (p *Post) HasTag(tag string) bool {
+    hasTag, _ := regexp.MatchString("#"+tag+`(?:[[:punct:]]|\s|\z)`, p.Content)
+    return hasTag
+}
+```
+
+#### 边界正则分析：
+
+`(?:[[:punct:]]|\s|\z)` 表示 hashtag 后面必须跟：
+- `[[:punct:]]` - 任意标点符号
+- `\s` - 任意空白字符
+- `\z` - 字符串结束
+
+#### 与数据库查询的边界差异：
+
+| 场景 | 边界规则 | 匹配 `#go-test` | 匹配 `#go.test` | 匹配 `#go` 在行尾 |
+|------|---------|----------------|----------------|------------------|
+| 数据库 `\b` (ICU) | 词边界 | ✅ | ✅ | ✅ |
+| 数据库 `[[:>:]]` (Spencer) | 右词边界 | ✅ | ❌ `.` 不是词字符 | ✅ |
+| HasTag `(?:[[:punct:]]\|\s\|\z)` | 标点/空白/行尾 | ✅ `-` 是标点 | ✅ `.` 是标点 | ✅ `\z` |
+
+**⚠️ 差异风险**：三种边界规则定义不完全一致，可能导致：
+- 数据库查询返回的文章，Reader 内存过滤可能排除
+- Reader 内存过滤包含的文章，数据库查询可能不返回
+- 典型案例：`#go.test` 在 MySQL 5.x 上数据库查询不匹配，但 HasTag 匹配
+
+---
+
+## 十一、MySQL 版本一致性判断逻辑
+
+### 11.1 useSpencerRegex 初始化
+
+**位置**：[app.go L605-L613](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/app.go#L605-L613)
+
+```go
+ver, err := app.db.version()
+if err != nil {
+    log.Error("Unable to get DB version: %v", err)
+} else {
+    log.Info("Database version: %v", ver)
+    if app.cfg.Database.Type == driverMySQL && strings.HasPrefix(ver, "5.") {
+        log.Info("Enabling compatibility for MySQL v5.x")
+        app.db.useSpencerRegex = true  // L612
+    }
+}
+```
+
+### 11.2 MySQL 正则实现历史
+
+MySQL 的正则表达式实现在版本 8.0.4 发生了重大变更：
+
+| MySQL 版本 | 正则实现 | 右词边界语法 |
+|-----------|---------|-------------|
+| 5.x | Henry Spencer 库 | `[[:>:]]` |
+| 8.0.0 - 8.0.3 | Henry Spencer 库 | `[[:>:]]` |
+| 8.0.4+ | ICU (International Components for Unicode) | `\b` |
+
+### 11.3 版本判断的完整性问题
+
+**⚠️ 关键 Bug**：代码只判断了 `strings.HasPrefix(ver, "5.")`，但忽略了 MySQL 8.0.0 - 8.0.3 也使用 Henry Spencer 实现。
+
+**受影响的版本范围**：
+
+| MySQL 版本 | 实际正则库 | 代码判断 `useSpencerRegex` | 实际应设置 | 结果 |
+|-----------|-----------|---------------------------|-----------|------|
+| 5.x | Spencer | `true` ✅ | `true` | 正确 |
+| 8.0.0 | Spencer | `false` ❌ | `true` | 错误 |
+| 8.0.1 | Spencer | `false` ❌ | `true` | 错误 |
+| 8.0.2 | Spencer | `false` ❌ | `true` | 错误 |
+| 8.0.3 | Spencer | `false` ❌ | `true` | 错误 |
+| 8.0.4+ | ICU | `false` ✅ | `false` | 正确 |
+
+**后果**：在 MySQL 8.0.0-8.0.3 上，代码使用 `\b`（ICU 语法），但数据库实际使用 Spencer 库，导致：
+- `\b` 在 Spencer 库中语义不同（匹配退格字符）
+- 标签查询可能无法正确匹配或匹配错误结果
+- `#go` 可能匹配到 `#golang`，或完全不匹配
+
+---
+
+## 十二、不同版本对标签页的影响分析
+
+### 12.1 对标签页总数的影响（TotalPages）
+
+标签页总数计算逻辑位于 [collections.go L1048-L1055](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/collections.go#L1048-L1055)：
+
+```go
+taggedPostIDs, err := app.db.GetAllPostsTaggedIDs(c, tag, cr.isCollOwner)
+ttlPosts := len(taggedPostIDs)
+pagePosts := coll.Format.PostsPerPage()
+coll.TotalPages = int(math.Ceil(float64(ttlPosts) / float64(pagePosts)))
+```
+
+**受影响场景**：
+
+| MySQL 版本 | 计数查询语法 | 分页查询语法 | 一致性 | 总数准确性 |
+|-----------|-------------|-------------|--------|-----------|
+| 5.x | `[[:>:]]` | `[[:>:]]` | ✅ 一致 | ✅ 准确 |
+| 8.0.0-8.0.3 | `[[:>:]]` | `\b`（错误） | ❌ 不一致 | ❌ 可能不准确 |
+| 8.0.4+ | `[[:>:]]`（错误） | `\b` | ❌ 不一致 | ❌ 可能不准确 |
+
+**风险场景示例**（MySQL 8.0.4+）：
+- 文章内容包含 `#golang` 和 `#go-test`
+- 搜索 `#go` 时：
+  - 计数查询使用 `#go[[:>:]]` → 匹配 `#go-test`（`-` 不是词字符），不匹配 `#golang`
+  - 分页查询使用 `#go\b` → 不匹配 `#go-test`（`.` 不是词边界），不匹配 `#golang`
+  - 结果：`TotalPages = ceil(1/10) = 1`，但第一页返回 0 篇文章
+
+### 12.2 对标签页列表的影响
+
+**调用链**：
+1. `handleViewCollectionTag()` → [collections.go L1064](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/collections.go#L1064)
+2. `db.GetPostsTagged()` → 数据库正则查询
+3. 每行 `p.extractData()` → 填充 `p.Tags`
+4. 每行 `p.formatContent()` → 渲染 HTML 链接
+
+**渲染后内容中的 hashtag 链接**：
+标签在文章内容中渲染为可点击链接的逻辑位于 [postrender.go L158-L171](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/postrender.go#L158-L171)，由 blackfriday + 正则替换实现，**不受数据库版本影响**。
+
+### 12.3 对链接渲染判断的影响
+
+链接渲染的前提条件判断位于 [postrender.go L158-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/postrender.go#L158-L159)：
+
+```go
+if baseURL != "" {
+    htmlFlags |= blackfriday.HTML_HASHTAGS
+}
+```
+
+**判断逻辑**：
+- 只判断 `baseURL != ""`
+- `baseURL` 来自 `c.CanonicalURL()` 或 `"/" + c.Alias + "/"`
+- 与数据库版本**无关**
+- 与 `useSpencerRegex` **无关**
+
+**特殊情况**：
+- 独立无主文章（不属于任何 Collection）：`baseURL = ""`，hashtag 不会被链接化，仅显示为纯文本 `#tag`
+- Chorus 模式：`tagPrefix = "/read/t/"`，链接格式为 `/read/t/golang`
+
+---
+
+## 十三、三处边界规则不一致的风险矩阵
+
+### 13.1 三种过滤机制的边界规则对比
+
+| 机制 | 位置 | 边界规则 | 受 MySQL 版本影响 |
+|------|------|---------|------------------|
+| 计数查询 (DB) | [database.go L1389](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/database.go#L1389) | `[[:>:]]`（硬编码） | 间接 |
+| 分页查询 (DB) | [database.go L1458](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/database.go#L1458) | 动态 `[[:>:]]` / `\b` | ✅ 是 |
+| Reader 过滤 (内存) | [posts.go L294](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/posts.go#L294) | `(?:[[:punct:]]\|\s\|\z)` | ❌ 否 |
+| Markdown 渲染 (Blackfriday) | blackfriday 内部 | 内部实现 | ❌ 否 |
+| Tags 提取 | `tags.Extract()` | 内部实现 | ❌ 否 |
+
+### 13.2 不一致导致的具体风险
+
+| 场景 | 风险描述 | 影响范围 |
+|------|---------|---------|
+| 标签页显示 | 总数与实际列表数量不符，分页导航错误 | Collection 标签页、RSS Feed |
+| 数据丢失 | 数据库查询不匹配某些 tag，但实际内容包含 | 所有依赖数据库查询的功能 |
+| 误匹配 | `#go` 匹配到 `#golang` 或相反 | 标签过滤结果不准确 |
+| Reader 不一致 | Reader 时间线显示的文章与数据库查询不同 | Chorus 模式全局标签时间线 |
+| ActivityPub 联邦 | 提取的 Tags 与数据库查询结果不同 | 联邦协议中的 tag 字段 |
+
+---
+
+## 十四、关键代码缺陷总结
+
+### 缺陷 1：GetAllPostsTaggedIDs 硬编码词边界
+**位置**：[database.go L1389](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/database.go#L1389)
+
+**问题**：MySQL 分支硬编码使用 `"[[:>:]]"`，未使用 `db.useSpencerRegex` 动态选择。
+
+**修复建议**：与 `GetPostsTagged` 保持一致，使用相同的 `boundaryRegex` 逻辑。
+
+---
+
+### 缺陷 2：MySQL 版本判断不完整
+**位置**：[app.go L610](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/app.go#L610)
+
+**问题**：仅判断 `strings.HasPrefix(ver, "5.")`，忽略了 8.0.0-8.0.3 也使用 Spencer 正则库。
+
+**修复建议**：
+```go
+// 解析版本号，判断是否小于 8.0.4
+if app.cfg.Database.Type == driverMySQL {
+    if strings.HasPrefix(ver, "5.") || isMySQLVersionLessThan804(ver) {
+        app.db.useSpencerRegex = true
+    }
+}
+```
+
+---
+
+### 缺陷 3：HasTag 与数据库边界不一致
+**位置**：[posts.go L294](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/posts.go#L294)
+
+**问题**：`HasTag` 使用 Go 正则 `(?:[[:punct:]]|\s|\z)`，与数据库的 `\b` / `[[:>:]]` 语义不同。
+
+**修复建议**：统一边界规则，或在文档中明确标注差异。
+
+---
+
+## 十五、测试建议
+
+现有 [postrender_test.go](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/postrender_test.go) 仅测试了 `applyBasicMarkdown`，缺少 hashtag 相关测试。
+
+建议增加以下测试场景：
+
+1. **边界字符测试**：`#go`、`#go-test`、`#go.test`、`#go,`、`#go:`、`#go`在行尾
+2. **大小写测试**：`#GoLang`、`#GOLANG`
+3. **非预期匹配测试**：`#go` 不应匹配 `#golang`
+4. **多标签测试**：`#go #golang`
+5. **数据库边界一致性测试**：验证同一内容在三种过滤机制下返回一致结果
+6. **MySQL 版本模拟测试**：模拟不同 MySQL 版本下的查询行为
