@@ -476,14 +476,20 @@ func (db *datastore) GetAllPostsTaggedIDs(c *Collection, tag string, includeFutu
 }
 ```
 
-#### 边界规则分析：
+#### 边界规则分析（已校准）：
 
-| 数据库 | 正则模式 | 词边界 | 是否使用 useSpencerRegex |
-|--------|---------|--------|--------------------------|
-| SQLite | `.*#tag\b.*` | `\b` | N/A |
-| MySQL | `#tag[[:>:]]` | `[[:>:]]` | ❌ 硬编码，未使用 |
+| 数据库 | 正则模式 | 词边界语法 | 引擎 | 是否使用 useSpencerRegex |
+|--------|---------|-----------|------|--------------------------|
+| SQLite | `.*#tag\b.*` | `\b` | Go RE2（[database-sqlite.go L28-L33](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/database-sqlite.go#L28-L33) 注册的 `regexp`） | N/A |
+| MySQL（任意版本） | `#tag[[:>:]]` | `[[:>:]]` | MySQL | ❌ 硬编码，未使用 |
 
-**⚠️ 关键 Bug**：MySQL 分支硬编码使用 `[[:>:]]`，没有根据 `db.useSpencerRegex` 动态选择。这导致在 MySQL 8.0.4+ 上，计数查询使用的是旧的 Spencer 语法 `[[:>:]]`，而分页查询使用的是 ICU 语法 `\b`。
+**⚠️ 关键 Bug（性质校准）**：`[[:>:]]` 是 Henry Spencer 专有的"右词边界"语法。MySQL 在 8.0.4 起切换到 ICU 正则引擎，ICU **根本不认识** `[[:>:]]`，会直接抛出 `ERROR 3685 (HY000): Illegal argument to a regular expression.`（已由 MySQL Bug #106504 / #112787 确认，8.0.27、8.0.38 均复现）。
+
+因此这**不是"计数与列表结果不一致"**，而是：
+- 在 **MySQL 8.0.4+（含 GA 8.0.11、8.4）**：`GetAllPostsTaggedIDs` 整个查询**报错** → [collections.go L1048-L1051](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/collections.go#L1048-L1051) 捕获后返回 `HTTP 500 "Couldn't retrieve tagged collection posts."` → **标签页直接打不开**，`GetPostsTagged` 根本不会被调用。
+- 在 **MySQL 5.x（Spencer）**：`[[:>:]]` 正常工作，计数正确。
+
+注意：分页查询 `GetPostsTagged`（[database.go L1450-L1458](file:///d:/fz/0601-2/solo-dogfeeding/code/29-writefreely/database.go#L1450-L1458)）已正确用 `useSpencerRegex` 选择 `[[:>:]]`/`\b`，所以 RSS Feed（走 `GetPostsTagged`）在 8.0.4+ 上反而能正常工作——这造成"HTML 标签页 500，但 RSS Feed 正常"的诡异差异。
 
 #### 时间边界：
 
