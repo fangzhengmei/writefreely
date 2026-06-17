@@ -10,23 +10,26 @@ WriteFreely 的联邦投递（ActivityPub）当前采用 **fire-and-forget（发
 
 ## 一、入队条件
 
-### 1.1 触发场景
+### 1.1 触发场景总览
 
-联邦投递在以下五种场景下被触发，均以 goroutine 异步方式执行：
+联邦投递有**五个独立的出站入口**，均以 goroutine 异步方式执行。各入口的前置判断策略不同，分为两类：
 
-| 场景 | 代码位置 | 说明 |
-|------|----------|------|
-| 发布新文章 | [posts.go:687](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L687-L687) | `go federatePost(app, newPost, newPost.Collection.ID, false)` |
-| 更新文章 | [posts.go:805](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L805-L805) | `go federatePost(app, pRes, pRes.Collection.ID, true)` |
-| 删除文章 | [posts.go:944](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L944-L944) | `go deleteFederatedPost(app, pp, collID.Int64)` |
-| 导入文章 | [account_import.go:166](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/account_import.go#L166-L166) | `go federatePost(...)` |
-| 认领文章 | [posts.go:1002](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L1002-L1002) | `go federatePost(app, pRes.Post, pRes.Post.Collection.ID, false)` |
+- **主动挡未来文章**：在调用 `federatePost` 前就检查 `!created.After(time.Now())`，未来文章连投递函数都不进
+- **只靠后续防守**：调用前不检查未来文章，依赖 `federatePost` 函数内部的两层检查兜底
 
-### 1.2 前置检查条件
+| 入口 | 触发场景 | 入口处检查 | 是否挡未来文章 | 调用函数 |
+|------|----------|------------|----------------|----------|
+| **发布新文章** | 用户发布新文章到集合 | 4 项检查 | **是** ✓ | `federatePost(isUpdate=false)` |
+| **更新文章** | 用户修改已发布文章 | 3 项检查 | **否** ✗ | `federatePost(isUpdate=true)` |
+| **删除文章** | 用户删除集合中的文章 | 3 项检查 | 不适用（删除无此概念） | `deleteFederatedPost` |
+| **导入文章** | 批量导入 Markdown 文件 | 2 项检查 | **否** ✗ | `federatePost(isUpdate=false)` |
+| **认领文章** | 把散落文章归入集合 | 4 项检查 | **是** ✓ | `federatePost(isUpdate=false)` |
 
-#### 触发点检查（posts.go）
+### 1.2 各入口前置判断详解
 
-在调用 `federatePost` 之前，需要满足以下条件：
+#### 1.2.1 发布新文章（主动挡未来文章）
+
+代码位置：[posts.go:685-688](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L685-L688)
 
 ```go
 if newPost.Collection != nil {
@@ -36,15 +39,93 @@ if newPost.Collection != nil {
 }
 ```
 
-条件拆解：
-1. **文章属于集合**：`newPost.Collection != nil` — 只有集合（博客）中的文章才会联邦投递
-2. **应用非私有**：`!app.cfg.App.Private` — 私有实例不进行联邦投递
-3. **联邦功能启用**：`app.cfg.App.Federation` — 配置中开启了联邦功能
-4. **非未来文章**：`!newPost.Created.After(time.Now())` — 创建时间晚于当前时间的文章不立即投递
+入口处**四项检查**全部满足才触发：
+1. `newPost.Collection != nil` — 文章必须属于集合
+2. `!app.cfg.App.Private` — 实例非私有
+3. `app.cfg.App.Federation` — 联邦功能已启用
+4. `!newPost.Created.After(time.Now())` — **创建时间不晚于当前**（未来文章直接跳过）
 
-#### 认领文章的触发点检查（posts.go:995-1003）
+**结论**：入口处即挡下未来文章，不会进入 `federatePost`。
 
-认领文章（Claim）是独立于发布/更新的第五个触发场景。用户将一篇散落在个人名下、尚未归属任何集合的文章"认领"到某个集合后，该文章变为集合内容，需要向联邦推送 Create 活动。
+#### 1.2.2 更新文章（只靠后续防守）
+
+代码位置：[posts.go:800-806](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L800-L806)
+
+```go
+if pRes.CollectionID.Valid {
+    coll, err := app.db.GetCollectionBy("id = ?", pRes.CollectionID.Int64)
+    if err == nil && !app.cfg.App.Private && app.cfg.App.Federation {
+        coll.hostName = app.cfg.App.Host
+        pRes.Collection = &CollectionObj{Collection: *coll}
+        go federatePost(app, pRes, pRes.Collection.ID, true)
+    }
+}
+```
+
+入口处**三项检查**：
+1. `pRes.CollectionID.Valid` — 文章已归属集合
+2. `!app.cfg.App.Private` — 实例非私有
+3. `app.cfg.App.Federation` — 联邦功能已启用
+
+**没有** `!Created.After(time.Now())` 检查。
+
+**结论**：即使是未来文章（创建时间在将来），只要属于集合且满足全局条件，也会调用 `federatePost`，然后在函数内部被挡下。属于**只靠后续防守**。
+
+#### 1.2.3 删除文章（特殊入口）
+
+代码位置：[posts.go:943-945](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L943-L945)
+
+```go
+if coll != nil && !app.cfg.App.Private && app.cfg.App.Federation {
+    go deleteFederatedPost(app, pp, collID.Int64)
+}
+```
+
+入口处**三项检查**：
+1. `coll != nil` — 文章属于集合
+2. `!app.cfg.App.Private` — 实例非私有
+3. `app.cfg.App.Federation` — 联邦功能已启用
+
+注意事项：
+- 调用的是 `deleteFederatedPost`，**不是** `federatePost`
+- `deleteFederatedPost` 函数**内部没有任何前置检查**（没有检查私有、没有检查集合可见性），只要调用了就会尝试投递 Delete 活动
+- 不存在"未来文章"概念（删除即删除）
+
+**结论**：删除入口的防守最薄弱，函数内部完全没有二次检查。
+
+#### 1.2.4 导入文章（只靠后续防守）
+
+代码位置：[account_import.go:165-177](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/account_import.go#L165-L177)
+
+```go
+if app.cfg.App.Federation && coll.ID > 0 {
+    go federatePost(
+        app,
+        &PublicPost{
+            Post: rp,
+            Collection: &CollectionObj{
+                Collection: *coll,
+            },
+        },
+        coll.ID,
+        false,
+    )
+}
+```
+
+入口处**仅两项检查**：
+1. `app.cfg.App.Federation` — 联邦功能已启用
+2. `coll.ID > 0` — 文章归属到有效集合
+
+**缺失的检查**（靠后续防守）：
+- ❌ **没有** `!app.cfg.App.Private` 检查
+- ❌ **没有** `!Created.After(time.Now())` 检查
+
+**结论**：入口防守最松，私有时或未来文章都会进入 `federatePost`，由函数内部兜底挡下。
+
+#### 1.2.5 认领文章（主动挡未来文章）
+
+代码位置：[posts.go:995-1004](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go#L995-L1004)
 
 ```go
 for _, pRes := range *res {
@@ -60,15 +141,17 @@ for _, pRes := range *res {
 }
 ```
 
-条件拆解：
-1. **认领成功**：`pRes.Code == http.StatusOK` — 只有认领操作成功的文章才触发投递，失败或冲突的跳过
-2. **应用非私有 + 联邦启用**：与发布场景相同的全局检查
-3. **非未来文章**：与发布场景相同，未来文章不立即投递
-4. **isUpdate = false**：认领相当于首次发布，使用 Create 活动而非 Update
+入口处**四项检查**：
+1. `pRes.Code == http.StatusOK` — 认领操作成功（失败或冲突的跳过）
+2. `!app.cfg.App.Private` — 实例非私有
+3. `app.cfg.App.Federation` — 联邦功能已启用
+4. `!pRes.Post.Created.After(time.Now())` — **创建时间不晚于当前**（未来文章跳过）
 
-#### 函数内部检查（federatePost）
+**结论**：与发布新文章一致，入口处即挡下未来文章。且由于认领相当于"首次在集合发布"，`isUpdate=false`，发送的是 Create 活动。
 
-进入 `federatePost` 函数后，还会进行两层检查：
+### 1.3 后续防守（federatePost 内部检查）
+
+调用 `federatePost` 后，函数内部还有两层检查作为兜底：
 
 ```go
 func federatePost(app *App, p *PublicPost, collID int64, isUpdate bool) error {
@@ -85,11 +168,24 @@ func federatePost(app *App, p *PublicPost, collID int64, isUpdate bool) error {
 }
 ```
 
-条件拆解：
-1. **应用非私有**（重复检查，防御性编程）
-2. **集合可见性**：私有集合（`CollPrivate`）和受保护集合（`CollProtected`）的文章不投递
+内部检查：
+1. `!app.cfg.App.Private` — 实例非私有（与入口重复检查，防御性编程）
+2. 集合可见性不是 `CollPrivate` 且不是 `CollProtected`
 
-### 1.3 投递目标分组逻辑
+**注意**：`federatePost` 内部**没有**检查未来文章。未来文章如果通过了入口（更新、导入场景），会被真实投递出去。
+
+### 1.4 前置判断对照表
+
+| 检查项 | 发布 | 更新 | 删除 | 导入 | 认领 | federatePost 内部 | deleteFederatedPost 内部 |
+|--------|------|------|------|------|------|-------------------|-------------------------|
+| 属于集合 | ✓ | ✓ | ✓ | ✓ | 隐含 | - | - |
+| 实例非私有 | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ |
+| 联邦启用 | ✓ | ✓ | ✓ | ✓ | ✓ | - | - |
+| 非未来文章 | ✓ | ✗ | 不适用 | ✗ | ✓ | ✗ | 不适用 |
+| 集合非私有/非保护 | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ |
+| 认领成功 | - | - | - | - | ✓ | - | - |
+
+### 1.5 投递目标分组逻辑
 
 入队后，在实际发送前会对收件箱进行分组优化：
 
@@ -113,7 +209,7 @@ for _, f := range *followers {
 2. **回退个人收件箱**：没有共享收件箱时，使用个人 `Inbox`
 3. **按收件箱去重**：同一收件箱只发送一次，通过 CC 字段包含所有关注者
 
-### 1.4 @提及用户的单独投递
+### 1.6 @提及用户的单独投递
 
 除了向关注者投递外，还会向文章中 @提及的用户单独投递：
 
@@ -324,25 +420,31 @@ func runJobs(app *App, jobs []*PostJob, reqColl bool) error {
 ### 4.1 联邦投递主流程
 
 ```
-发布/更新/删除/认领文章
+发布/更新/删除/导入/认领文章
     ↓
-posts.go 中检查触发条件
+各入口独立的前置检查
+    ├─ 发布：4项检查 ✓（含未来文章）
+    ├─ 更新：3项检查 ✗（无未来文章）
+    ├─ 删除：3项检查 → deleteFederatedPost
+    ├─ 导入：2项检查 ✗（最松）
+    └─ 认领：4项检查 ✓（含未来文章）
     ↓
 go federatePost()  // 异步 goroutine
     ↓
-federatePost() / deleteFederatedPost()
-    ├─ 检查应用是否私有
-    ├─ 检查集合可见性
-    ├─ 获取关注者列表
-    ├─ 按收件箱分组（共享收件箱优先）
-    └─ 遍历每个收件箱
-            ↓
-        makeActivityPost()
-            ├─ 构造 HTTP 请求
-            ├─ 签名
-            ├─ 发送（15 秒超时）
-            ├─ 网络层错误 → return err → 上层 log.Error → 终止
-            └─ 拿到响应（不管 200/4xx/5xx）→ return nil → 上层无感知
+federatePost() 内部兜底检查
+    ├─ 应用是否私有？
+    └─ 集合可见性？
+    ↓
+获取关注者列表，按收件箱分组
+    ↓
+遍历每个收件箱
+    ↓
+makeActivityPost()
+    ├─ 构造 HTTP 请求
+    ├─ 签名
+    ├─ 发送（15 秒超时）
+    ├─ 网络层错误 → return err → 上层 log.Error → 终止
+    └─ 拿到响应（不管 200/4xx/5xx）→ return nil → 上层无感知
 ```
 
 ### 4.2 收件箱处理异步流程
@@ -367,7 +469,11 @@ handleFetchCollectionInbox()
 | 维度 | 现状 |
 |------|------|
 | **入队方式** | goroutine 异步触发，无持久化队列 |
-| **入队条件** | 5 个触发场景 + 4 项前置检查 |
+| **出站入口** | 5 个独立入口：发布、更新、删除、导入、认领 |
+| **入队前置检查** | 各入口不等：发布/认领 4 项最严，更新/删除 3 项，导入仅 2 项最松 |
+| **挡未来文章** | 发布、认领 在入口处主动挡；更新、导入 只靠后续防守（不挡，直接投出） |
+| **federatePost 内部防守** | 仅检查实例私有 + 集合可见性，不检查未来文章 |
+| **deleteFederatedPost 内部防守** | **完全没有任何检查**，入口调用即发送 |
 | **重试机制** | 无，fire-and-forget |
 | **退避梯度** | 无（Follow 回复有 2 秒初始延迟，非重试退避） |
 | **终态判定** | 无（失败即终态，仅记录日志） |
@@ -388,7 +494,8 @@ handleFetchCollectionInbox()
 | 文件 | 主要内容 |
 |------|----------|
 | [activitypub.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/activitypub.go) | 联邦投递核心逻辑，包含 `federatePost`、`deleteFederatedPost`、`makeActivityPost` |
-| [posts.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go) | 文章发布/更新/删除入口，触发联邦投递 |
+| [posts.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/posts.go) | 文章发布/更新/删除/认领入口，触发联邦投递 |
+| [account_import.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/account_import.go) | 文章批量导入入口，触发联邦投递 |
 | [jobs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/jobs.go) | 邮件发布队列消费逻辑 |
 | [database.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/database.go) | `publishjobs` 表的数据库操作（InsertJob、GetJobsToRun、DeleteJob 等） |
 | [email.go](file:///d:/fz/0601-2/solo-dogfeeding/code/12-writefreely/email.go) | 邮件发送逻辑，`emailSendDelay` 常量 |
