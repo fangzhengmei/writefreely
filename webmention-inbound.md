@@ -205,8 +205,11 @@ POST /{alias}/inbox
 | `GetActor(0) == nil` | Follow 没有 actor | 回调返回 error → Deserialize 失败 → 200 空 body |
 | `getActor` 失败 | actor 拉不到 | 同上 |
 | `to == nil` | `GetActor(0)` 返回 nil | 回调返回 `fmt.Errorf("No valid 'to' string")` → 同上 |
-| **Accept 序列化失败** | `a.Serialize()` 报错 | goroutine 内 log + return，**不落库** |
-| **Accept 发送失败** | `makeActivityPost` 报错 | goroutine 内 log + return，**不落库** |
+| `to == nil`（goroutine 内） | Delete 等分支的 `to` 为 nil，goroutine 开头就 return | goroutine 提前退出，**但 Follow 分支不会触发此条**（to 在回调内已校验） |
+| **Accept 序列化失败** | `a.Serialize()` 报错（activitystreams 序列化异常） | goroutine 内 log + return，**不落库** |
+| **Accept HTTP 请求网络层失败** | `activityPubClient().Do(r)` 报错（连接超时、DNS 失败、连接拒绝等） | goroutine 内 log + return，**不落库** |
+| **Accept HTTP 业务层失败（4xx/5xx）** | 远端返回 400/401/403/404/500 等 | **不触发错误**，`makeActivityPost` 不检查 `resp.StatusCode`，照常 return nil → **继续入库** |
+| **Accept 签名失败** | `signer.SignSigHeader` 报错 | **不触发错误**，`makeActivityPost` 只打 log 不 return error → **继续入库**，即未签名的请求发出后远端可能拒绝，但本地仍会入库 |
 | `INSERT remoteusers` 失败 | DB 写入异常（非重复键） | goroutine 内回滚 + log + return |
 | `LastInsertId` 失败 | 拿不到自增 ID | goroutine 内回滚 + log + return |
 | `INSERT remoteuserkeys` 失败（非重复键） | 公钥写入异常 | goroutine 内回滚 + log + return |
@@ -215,7 +218,7 @@ POST /{alias}/inbox
 | `INSERT remotefollows` 失败（重复键） | 重复关注 | **不回滚，不报错，静默继续**（[`L707-L712`](./activitypub.go#L707-L712) 只有 `if !isDuplicateKeyErr` 才回滚） |
 | `Commit` 失败 | 提交失败 | goroutine 内回滚 + log + return |
 
-> 关键差异：Follow 的入库发生在「Accept 发出去之后」，如果 Accept 发送失败，**库也不落**——相当于「先通知对方我接受了，再自己记账」。另外重复键的处理是幂等放过，跟 Like 分支的「重复键也报错」策略不同。
+> 关键校准：Follow 的入库发生在「Accept 发出去之后」，但**只有 Accept 序列化失败或网络层失败才会阻断入库**。远端回 4xx/5xx、甚至本地签名失败，都不会阻止入库——相当于「不管对方收不收得到，只要网络能通就记账」。这与之前文档所写的「Accept 发送失败就不落库」有本质差异。另外重复键的处理是幂等放过，跟 Like 分支的「重复键也报错」策略不同。
 
 ### 7.3 Undo 分支
 
@@ -255,14 +258,14 @@ Undo 是四个分支里最复杂的，因为它内部又分 **Undo:Like** 和 **
 - 同时设 `responseWritten = true`（[`L536`](./activitypub.go#L536-L536)）。
 - 行为与 Follow 分支一致。
 
-**入库**：异步 goroutine，单条 DELETE，**非事务**。
+**入库**：异步 goroutine，在 Accept 发出去之后才执行单条 DELETE，**非事务**。
 - 位置：[`L721-L726`](./activitypub.go#L721-L726) 的 `else if isUnfollow { ... }` 块
 - SQL：`DELETE FROM remotefollows WHERE collection_id = ? AND remote_user_id = (SELECT id FROM remoteusers WHERE actor_id = ?)`
 - **没有事务包裹**，直接 `app.db.Exec`。
-- **失败只打 log**（[`L724-L726`](./activitypub.go#L724-L726)），不回滚不报错。
-- 跟 Follow 的「先发 Accept 再落库」对应：Undo 也是「先回 200、异步里发 Accept、然后删库」——注意发 Accept 的逻辑在 `go func()` 开头 [`L647-L662`](./activitypub.go#L647-L662) 就做了，`isUnfollow` 分支在更后面。
+- **SQL 执行失败只打 log**（[`L724-L726`](./activitypub.go#L724-L726)），不 return、不阻断。
+- 与 Follow 对称，Undo:Follow 也先在 goroutine 开头 [`L647-L662`](./activitypub.go#L647-L662) 发 Accept，再执行删库——但**Accept 的 4xx/5xx 响应、签名失败都不会阻断删除**，只有 Accept 序列化失败或网络层失败才会提前 return 不删库。
 
-> 两个不对称：(1) Follow 用 `getActor`（会回源），Undo:Follow 用 `getRemoteUser`（仅本地）；(2) Follow 入库是事务，Undo:Follow 入库是非事务。这是代码演进过程中产生的不一致，不是设计出来的。
+> 两个不对称：(1) Follow 用 `getActor`（会回源），Undo:Follow 用 `getRemoteUser`（仅本地）；(2) Follow 入库是事务，Undo:Follow 入库是非事务；(3) Follow 的 `remoteusers` INSERT 有分支逻辑，Undo:Follow 的 DELETE 直接一条 SQL 带子查询。这是代码演进过程中产生的不一致，不是设计出来的。
 
 ### 7.4 Delete 分支
 
@@ -296,7 +299,9 @@ Undo 是四个分支里最复杂的，因为它内部又分 **Undo:Like** 和 **
 | **响应写回时机** | 同步处理块末尾 | 回调内即时 | 同步处理块末尾 | 回调内即时 | 回调内即时 |
 | **响应 body** | 空 `""` | 原始 payload `m` | 空 `""` | 原始 payload `m` | 原始 payload `m` |
 | **responseWritten 标记点** | 回调内设（但实际在同步块写） | 回调内设 + 写 | 不设 | 回调内设 + 写 | 回调内设 + 写 |
-| **入库方式** | 同步事务 | **异步 goroutine**（2s 延迟 + 先发 Accept 再落库） | 同步事务 | **异步 goroutine**，非事务 | 无 |
+| **入库方式** | 同步事务 | **异步 goroutine**（2s 延迟 + 先发 Accept 再落库；Accept 4xx/5xx/签名失败不阻断入库，仅序列化/网络层失败阻断） | 同步事务 | **异步 goroutine**，非事务（先发 Accept 再删库；Accept 4xx/5xx/签名失败不阻断删除） | 无 |
+| **Accept 出站请求的状态码检查** | - | **不检查**，`makeActivityPost` 读取 body 但不校验 `resp.StatusCode`，4xx/5xx 照常 return nil | - | 同 Follow | - |
+| **Accept 签名失败的行为** | - | 只打 log 不报错，继续入库（未签名请求可能被远端拒收，但本地仍记账） | - | 同 Follow | - |
 | **入库表** | `remote_likes`（INSERT） | `remoteusers` + `remoteuserkeys` + `remotefollows` | `remote_likes`（DELETE） | `remotefollows`（DELETE） | - |
 | **回调错误 → 最终 HTTP 状态** | 静默 200 空 body | 静默 200 空 body | 静默 200 空 body | 静默 200 空 body | - |
 | **同步块 DB 错误 → 最终 HTTP 状态** | 500（return err 冒泡） | - | 500（return err 冒泡） | - | - |
@@ -330,7 +335,8 @@ Undo 是四个分支里最复杂的，因为它内部又分 **Undo:Like** 和 **
 2. **object IRI 不校验 host，draft post 形式连 DB 校验都没有**：[`parsePostIDFromURL`](./activitypub.go#L1206-L1232) 的正则只匹配路径尾部，不校验 scheme/host。collection post 形式虽然靠 `GetCollection`+`GetPost` 的数据存在性查询间接过滤，但攻击者知道内部 alias/slug 即可定向伪造；draft post 形式（`/api/posts/{id}`）连这个间接过滤都没有，正则匹配上就直接用 ID，理论上可以对任意猜测的 ID 写入/删除 `remote_likes`。
 3. **Follow 的 object 完全不校验**：[`activitypub.go#L452-L463`](./activitypub.go#L452-L463) 只拿 `GetObjectIRI` 填 Accept 活动的 actor 字段，不校验 host、不校验是否为本地 collection、不校验是否匹配 URL 路径中的 `{alias}`。伪造的 object IRI 会被原样回写到 Accept 活动中发给远端。
 4. **不校验 actor 与 object 的关系**：Like/Unlike/Follow/Undo:Follow 分支都只分别校验 actor 和 object 各自「看起来合法」，但完全不检查「这个 actor 是否有理由对这个 object 做这个操作」（例如 actor 是否真的之前赞过、是否有权限取消赞）。结合无签名校验，伪造成本为零。
-5. **入站提及（Create+Mention）不被处理**：缺 `CreateCallback`，[`activitypub.go#L549-L559`](./activitypub.go#L549-L559) 仅回 200。真正「提及了我」的语义在入站侧缺失；出站侧的 Mention 标签构建见 [`posts.go#L1281-L1299`](./posts.go#L1281-L1299) 与发送逻辑 [`activitypub.go#L971-L994`](./activitypub.go#L971-L994)（出站，非本主题）。
-6. **Delete 是「假删除」**：[`activitypub.go#L539-L547`](./activitypub.go#L539-L547) 不清理本地 like/follow 记录。
-7. **Follow 落库在异步 goroutine**：[`activitypub.go#L639`](./activitypub.go#L639-L639) `go func()`，且先 `time.Sleep(2s)` 再发 Accept 后写库，排查「收到 Follow 但 follower 未即时入库」时需注意这段延迟与异步特性。
-8. **回显仅计数、仅博主可见**：[`collection-post.tmpl#L58`](./templates/collection-post.tmpl#L58-L58) 受 `.IsOwner` 包裹，访客看不到点赞数。
+5. **Accept 出站不检查状态码，签名失败也不报错**：[`makeActivityPost`](./activitypub.go#L740-L797) 不检查 `resp.StatusCode`，远端回 4xx/5xx 也照常 return nil；`signer.SignSigHeader` 失败只打 log 不 return error。因此 Follow/Undo:Follow 的 Accept 只要 TCP 能打通，不管远端实际收到与否、是否拒绝，本地都会照常入库/删除——存在远端状态与本地状态不一致的风险。
+6. **入站提及（Create+Mention）不被处理**：缺 `CreateCallback`，[`activitypub.go#L549-L559`](./activitypub.go#L549-L559) 仅回 200。真正「提及了我」的语义在入站侧缺失；出站侧的 Mention 标签构建见 [`posts.go#L1281-L1299`](./posts.go#L1281-L1299) 与发送逻辑 [`activitypub.go#L971-L994`](./activitypub.go#L971-L994)（出站，非本主题）。
+7. **Delete 是「假删除」**：[`activitypub.go#L539-L547`](./activitypub.go#L539-L547) 不清理本地 like/follow 记录。
+8. **Follow 落库在异步 goroutine**：[`activitypub.go#L639`](./activitypub.go#L639-L639) `go func()`，且先 `time.Sleep(2s)` 再发 Accept 后写库，排查「收到 Follow 但 follower 未即时入库」时需注意这段延迟与异步特性。
+9. **回显仅计数、仅博主可见**：[`collection-post.tmpl#L58`](./templates/collection-post.tmpl#L58-L58) 受 `.IsOwner` 包裹，访客看不到点赞数。
