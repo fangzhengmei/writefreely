@@ -32,14 +32,15 @@
 
 **关键结论：入站 ActivityPub 请求不做 HTTP 签名验证。** 仓库里 `httpsig` 仅用于「出站签名」（见 [`makeActivityPost`](./activitypub.go#L764-L764) 与 [`resolveIRI`](./activitypub.go#L816-L816) 调用 `httpsig.NewSigner`），全仓库检索 `httpsig.Verify` / `VerifySignature` 零命中。也就是说，任何能 POST 到 `/{alias}/inbox` 的请求都会进入业务逻辑。
 
-实际的「来源验证」退化为「拉取并确认 actor 存在」：
+实际的「来源验证」退化为「拉取并确认 actor 存在 + 通过 DB 查询间接过滤非本站对象」：
 
-1. [`handleFetchCollectionInbox`](./activitypub.go#L317-L738) 先按 `alias` 取出本地 collection，并做静默检查 [`IsUserSilenced`](./activitypub.go#L333-L333)（被静默的博客直接返回 404，相当于拒绝入站）。
-2. 各回调内通过 [`getActor`](./activitypub.go#L1053-L1096) 处理来源：
+1. [`handleFetchCollectionInbox`](./activitypub.go#L317-L738) 先按 URL 路径中的 `alias` 取出本地 collection，并做静默检查 [`IsUserSilenced`](./activitypub.go#L333-L333)（被静默的博客直接返回 404，相当于拒绝入站）。注意这一步**只校验路径里的 alias**，不校验 HTTP 请求的 Host 头是否与 `cfg.App.Host` 一致。
+2. 各回调内通过 [`getActor`](./activitypub.go#L1053-L1096) 处理来源（actor 侧）：
    - 先 [`getRemoteUser`](./activitypub.go#L1001-L1017) 查本地 `remoteusers` 表；命中即复用。
    - 未命中（404）则真正去远端拉取 actor：[`resolveIRI`](./activitypub.go#L799-L849) 用实例私钥签名后 `GET` actor IRI，再用 [`unmarshalActor`](./activitypub.go#L1166-L1204) 规范化（兼容各实现的 `@context` 字段差异）。
    - 注意 `getActor` 还会二次 `resolveIRI` `baseActor.PublicKey.Owner`（[`activitypub.go#L1077`](./activitypub.go#L1077-L1077)）拿「真正 actor」，存在两段式抓取。
 3. 这一阶段只是「能拉到 actor 就算来源可信」，**并未用 actor 公钥校验本次请求签名**——这是与标准 ActivityPub 安全模型的最大偏差，也是与 Webmention「回源验证 source 链接 target」在语义上最接近却又不等价的环节。
+4. 对于 Like/Undo:Like 的 object 侧（被点赞的文章），代码里**没有显式校验 object IRI 的 host**（详见第 7 节逐分支分析）。所谓「target 归属校验」只是 `GetCollection(alias)` + `GetPost(slug, collID)` 这两个 DB 查询的**间接结果**——如果 alias/slug 在本地 DB 里不存在，就拿不到 postID；但这完全是「数据是否存在」的查询，不是「host 是否为本机」的协议层校验。
 
 ## 3. 内容抓取（Content Fetching）
 
@@ -52,7 +53,11 @@
    - `UndoCallback`（处理 Undo:Like / Undo:Follow，[`L477`](./activitypub.go#L477-L477)）
    - `DeleteCallback`（[`L539`](./activitypub.go#L539-L539)）
 3. **没有 `CreateCallback`。** 解析失败/未知类型会落到 [`L549-L559`](./activitypub.go#L549-L559) 仅记录日志并返回 200。这意味着远端发来的「带 Mention 标签的 Create 活动」（即真正意义上的「别人提及了我」）**不会被解析、不会被入库**——只是被「已读回执」。
-4. 对 Like/Unlike，进一步从 `object` IRI 抽取本地文章 ID：[`parsePostIDFromURL`](./activitypub.go#L1206-L1232)，用 `apCollectionPostIRIRegex` / `apDraftPostIRIRegex`（[`L50-L51`](./activitypub.go#L50-L51)）匹配，必要时再 `GetCollection`+`GetPost` 反查 slug→postID。
+4. 对 Like/Unlike，进一步从 `object` IRI 抽取本地文章 ID：[`parsePostIDFromURL`](./activitypub.go#L1206-L1232)。需要注意这里的边界：
+   - 正则 `apCollectionPostIRIRegex` / `apDraftPostIRIRegex`（[`L50-L51`](./activitypub.go#L50-L51)）**只匹配 URL 的路径尾部**，不校验 scheme、不校验 host。例如 `http://evil.com/api/collections/myblog/posts/abc123` 也能匹配上，只要末尾路径对得上。
+   - `u.String()` 传入的是完整 IRI（含 scheme + host），但正则只对尾部做 `$` 锚定。
+   - 实际的「过滤非本站文章」效果来自后面的 `GetCollection(collAlias)` + `GetPost(slug, c.ID)`（[`L1220-L1228`](./activitypub.go#L1220-L1228)）：只有 alias 和 slug 在本地 DB 真实存在时，才返回 postID。这是**查询命中带来的副作用**，不是主动的 host 归属校验。
+   - 对 `/api/posts/{id}` 形式（草稿 IRI），没有 DB 查询兜底：正则匹配上就直接返回 `m[1]` 作为 postID，**完全不校验这个 ID 是否真实存在于本地**，也不校验 host。
 5. actor 侧的「内容抓取」复用第 2 阶段的 `getActor`/`resolveIRI`。
 
 > 对比：典型 Webmention 接收器在此阶段会抓取 source 页面 HTML 并解析 `h-entry` 取摘要/作者；这里抓取的是 **actor 的 ActivityStreams JSON**，抓的是「谁」，而非「说了什么内容」。所以「回显」阶段也只能回显计数，无法回显提及正文（见第 5 节）。
@@ -131,10 +136,15 @@ POST /{alias}/inbox
 
 **入口**：[`LikeCallback`](./activitypub.go#L379-L426)
 
-**来源校验**：强度中等。
-1. 先从 Like 活动取 `object` IRI（即被点赞的帖子），用 [`parsePostIDFromURL`](./activitypub.go#L1206-L1232) 校验并解析为本地 `post_id`——这相当于「target 归属校验」。若 `object` 缺失或不是本站 IRI，直接返回 error（最终静默 200）。
-2. 再从 Like 活动取 `actor`（点赞者），调 [`getActor`](./activitypub.go#L1053-L1096) 完整两段式拉取：本地 `remoteusers` 查不到就去远端 GET actor IRI，再 GET `publicKey.owner` 拿「真正 actor」。
-3. **不校验签名**：只确认 actor 存在，不用 actor 公钥校验本次请求。
+**来源校验**：强度弱。
+1. 先从 Like 活动取 `object` IRI（被点赞的帖子），调 [`parsePostIDFromURL`](./activitypub.go#L1206-L1232)：
+   - 正则 `apCollectionPostIRIRegex` / `apDraftPostIRIRegex` 只匹配路径尾部，**不校验 IRI 的 scheme/host**，`http://evil.com/api/collections/myblog/posts/abc123` 这种带任意 host 的 IRI 也能匹配。
+   - 对 collection post 形式（`/api/collections/{alias}/posts/{slug}`），进一步 `GetCollection(alias)` + `GetPost(slug, collID)`——这是**数据存在性查询**，不是 host 归属校验；它的副作用是「只有本地真实存在的 alias+slug 才能拿到 postID」，但如果攻击者知道内部 alias/slug，定向伪造是可行的。
+   - 对 draft post 形式（`/api/posts/{id}`），**无任何 DB 校验**，正则匹配成功就直接返回 id 作为 postID。
+   - 所以这一步**不是「target 归属校验」**，只能算「target 格式匹配 + 可选的数据存在性检查」。若 `object` 缺失或格式完全不匹配，返回 error（最终静默 200）。
+2. 再从 Like 活动取 `actor`（点赞者），调 [`getActor`](./activitypub.go#L1053-L1096) 完整两段式拉取：本地 `remoteusers` 查不到就去远端 GET actor IRI，再 GET `publicKey.owner` 拿「真正 actor」。这一步只确认 actor 可达、可解析。
+3. **不校验签名**：不用 actor 公钥校验本次请求，actor 信息是可信（来自远端 GET）但「本次请求是否由该 actor 发起」完全未证实。
+4. **不校验 actor 与 object 的关系**：没有任何逻辑检查「这个 actor 是否有权限/有理由对这篇 post 做操作」，只要两者分别合法就放行。
 
 **响应写回**：容易误读的一段逻辑。
 - 回调末尾设 `responseWritten = true`（[L425](./activitypub.go#L425-L425)），但**回调本身并不写响应**，只 `return nil`。
@@ -152,7 +162,7 @@ POST /{alias}/inbox
 | --- | --- | --- |
 | `HasObject(0) == NoPresence` | Like 活动没有 object | 回调返回 error → Deserialize 失败 → 200 空 body |
 | `GetObjectIRI(0) == nil` | object 不是 IRI 形式 | 同上 |
-| `parsePostIDFromURL` 失败 | object IRI 不匹配本站格式 / 文章不存在 | 同上 |
+| `parsePostIDFromURL` 失败 | object IRI 路径格式不匹配 / collection 文章不存在 | 同上 |
 | `GetActor` 失败 | actor 拉不到 | 同上 |
 | `db.Begin()` 失败 | DB 连不上 | 同步块 `return err` → 外层 500 |
 | `INSERT remote_likes` 失败（非重复键） | DB 写入异常 | 回滚 + `return err` → 外层 500 |
@@ -165,10 +175,15 @@ POST /{alias}/inbox
 
 **入口**：[`FollowCallback`](./activitypub.go#L428-L476)
 
-**来源校验**：强度中等，跟 Like 基本一致但校验对象不同。
-1. 从 Follow 活动取 `actor`（关注者），调 [`getActor`](./activitypub.go#L1053-L1096) 完整两段式拉取。
-2. `object` 端（被关注的 collection）做了双重兜底：先 `GetObjectIRI`，拿不到就 `GetObject(0).GetId()`（[`L452-L462`](./activitypub.go#L452-L462)），再拿不到就只打 log 不报错。**没有校验 object 是否是本地 collection**——理论上外部可以用任意 object IRI 触发 Follow 入库。
-3. 同样不校验签名。
+**来源校验**：强度弱。
+1. 从 Follow 活动取 `actor`（关注者），调 [`getActor`](./activitypub.go#L1053-L1096) 完整两段式拉取——只确认 actor 可达、可解析。
+2. `object` 端（被关注的 collection）做了双重兜底：先 `GetObjectIRI`，拿不到就 `GetObject(0).GetId()`（[`L452-L462`](./activitypub.go#L452-L462)），再拿不到就只打 log 不报错。**完全不校验 object**：
+   - 不校验 object IRI 的 host/scheme；
+   - 不校验 object 是否指向本地 collection（没有 `GetCollection` 或类似 DB 查询）；
+   - 不校验 object 是否与 URL 路径中的 `{alias}` 一致。
+   - 理论上外部可以用任意 object IRI 触发 Follow 入库，Accept 活动里会把这个「伪造的 object」作为 actor 回写给远端。
+3. 不校验签名。
+4. 不校验 actor 与 object 的关系（例如「actor 是否在关注 object 所指向的本地 collection」）——虽然最终入库时用的是路径 alias 对应的 `c.ID`，但 Accept 活动里回写的 actor 是未经校验的 object IRI。
 
 **响应写回**：回调内即时写，body 为原始 payload。
 - 位置：回调末尾 [`L475`](./activitypub.go#L475-L475) `return impart.RenderActivityJSON(w, m, http.StatusOK)`
@@ -210,7 +225,9 @@ Undo 是四个分支里最复杂的，因为它内部又分 **Undo:Like** 和 **
 
 #### 7.3.1 Undo:Like（取消点赞）
 
-**来源校验**：与 Like 分支**完全相同**——`getActor` 两段式拉取 + `parsePostIDFromURL` 校验 object。
+**来源校验**：与 Like 分支**完全相同**——强度弱。
+- `parsePostIDFromURL` 不校验 host，collection post 形式靠 `GetCollection` + `GetPost` 的数据存在性查询间接过滤，draft post 形式无任何 DB 校验。
+- `getActor` 两段式拉取 actor，不校验签名、不校验 actor 与 object 的关系。
 - 位置：[`UndoCallback` 内的 `LikeCallback`](./activitypub.go#L488-L504)
 
 **响应写回**：**回调里不写，也不设 `responseWritten`**。
@@ -272,7 +289,9 @@ Undo 是四个分支里最复杂的，因为它内部又分 **Undo:Like** 和 **
 
 | 维度 | Like | Follow | Undo:Like | Undo:Follow | Delete |
 | --- | --- | --- | --- | --- | --- |
-| **来源校验强度** | 中等：`getActor` 两段式 + `parsePostIDFromURL` | 中等：`getActor` 两段式；object 不校验归属 | 中等：与 Like 完全相同 | **弱**：仅 `getRemoteUser` 本地查，不回源 | **无** |
+| **来源校验强度** | **弱**：`getActor` 两段式 + `parsePostIDFromURL`（仅路径匹配，不校验 host；draft 形式无 DB 校验） | **弱**：`getActor` 两段式；object 完全不校验（不校验 host、不校验是否为本地 collection、不校验是否匹配路径 alias） | **弱**：与 Like 完全相同 | **弱**：仅 `getRemoteUser` 本地查，不回源、不校验签名、不校验 object | **无** |
+| **object IRI 的 host 校验** | 无（正则只匹配路径尾部） | 无（不解析不校验） | 无（同 Like） | 无（仅读 actor IRI，不校验 object） | 无 |
+| **object IRI 的数据存在性校验** | collection post 形式有（`GetCollection`+`GetPost` 间接过滤）；draft 形式无 | 无 | 同 Like | 无 | 无 |
 | **签名校验** | 无 | 无 | 无 | 无 | 无 |
 | **响应写回时机** | 同步处理块末尾 | 回调内即时 | 同步处理块末尾 | 回调内即时 | 回调内即时 |
 | **响应 body** | 空 `""` | 原始 payload `m` | 空 `""` | 原始 payload `m` | 原始 payload `m` |
@@ -294,7 +313,7 @@ Undo 是四个分支里最复杂的，因为它内部又分 **Undo:Like** 和 **
 | 阶段 | 标准 Webmention 接收器 | 现有 ActivityPub inbox（WriteFreely） | 差异 / 缺失 |
 | --- | --- | --- | --- |
 | **入口** | `POST /webmention`，form-encoded `source` & `target` 字段 | `POST /{alias}/inbox`，ActivityStreams JSON body | 协议完全不同；但都是「通知某 URL 被外部页面引用/互动」的入站通道 |
-| **来源验证** | 1. 校验 source、target 为合法 URL<br>2. 抓取 source 页面，检查其中是否真有链接指向 target（回源验证）<br>3. 可选：检查 target 是否为本站资源（目标归属校验） | 1. `getActor` 拉取远端 actor JSON，确认 actor 存在<br>2. `parsePostIDFromURL` 校验 object IRI 是否为本站文章（≈ target 归属校验）<br>3. **不做 HTTP 签名验证**（见 [`handle.go#L567`](./handle.go#L567-L567) TODO） | Webmention 是「回源查 HTML 链接」，这里是「回源查 actor JSON」；两者都验证了「来源地址可达」，但**都没实现各自协议的标准安全手段**（Webmention 的 source→target 链接检查未做，ActivityPub 的签名验证未做） |
+| **来源验证** | 1. 校验 source、target 为合法 URL<br>2. 抓取 source 页面，检查其中是否真有链接指向 target（回源验证）<br>3. 可选：检查 target 是否为本站资源（目标归属校验） | 1. `getActor` 拉取远端 actor JSON，确认 actor 存在<br>2. `parsePostIDFromURL` 匹配 object IRI 的**路径尾部**（不校验 host），collection post 形式通过 `GetCollection`+`GetPost` 的数据存在性查询**间接**过滤；draft post 形式无任何兜底<br>3. Follow 的 object **完全不校验**（不校验 host、不校验是否为本地 collection、不校验是否匹配路径 alias）<br>4. **不做 HTTP 签名验证**（见 [`handle.go#L567`](./handle.go#L567-L567) TODO）<br>5. **不校验 actor 与 object 的关系**（「actor 对这篇 post 做这个操作是否合理」完全不检查） | Webmention 是「回源查 HTML 链接」，这里是「回源查 actor JSON」；Webmention 显式校验 target host/source→target 链接，这里两者都不做，所谓「target 归属校验」只是 DB 查询命中的副作用。两者都未实现各自协议的标准安全手段（ActivityPub 签名验证、Webmention 回源链接检查） |
 | **内容抓取** | 抓取 source 页面 HTML → 解析 microformats2（`h-entry` 的 `p-name`/`e-content`/`p-author h-card` 等）→ 提取标题、正文摘要、作者、发布时间 | 1. 解析入站 ActivityStreams JSON（`streams.Resolver` 回调）<br>2. 再 GET actor IRI 拿作者信息（`resolveIRI`）<br>3. **不解析「提及/回复的正文内容」**（缺 Create 回调） | Webmention 抓的是「被引用页面的 HTML 内容」；这里抓的是「发件人 actor 的 JSON 元数据」。**提及正文完全不被抓取和保留**，只有 Like/Follow 这类类型级语义 |
 | **归档入库** | 写入 webmentions 表：source URL、target post_id、作者信息、内容摘要、状态（待审核/已批准）、类型（mention/reply/like/repost 等） | Like → `remote_likes`<br>Follow → `remoteusers` + `remoteuserkeys` + `remotefollows`<br>**Create/Mention → 不入库** | 结构不同：Webmention 是「一条提及一条记录」，这里是「按交互类型分表存计数关联」。最大缺失是 **没有 mention/reply 类内容的表** |
 | **回显** | 1. 在文章下方渲染 mention/reply 列表（作者头像、名称、内容片段、来源链接）<br>2. 可能聚合 likes/reposts 计数 | 1. 仅 Like 计数（`remote_likes COUNT`）<br>2. 仅博主本人可见（[`collection-post.tmpl#L58`](./templates/collection-post.tmpl#L58-L58) 受 `.IsOwner` 包裹）<br>3. 统计页可见总计数（[`stats.tmpl#L61`](./templates/user/stats.tmpl#L61-L61)） | 量级差异巨大：Webmention 是「完整对话回显」，这里只是「博主自用的点赞计数器」 |
@@ -308,7 +327,10 @@ Undo 是四个分支里最复杂的，因为它内部又分 **Undo:Like** 和 **
 ## 9. 关键观察与风险点
 
 1. **无入站签名校验**：[`handle.go#L567`](./handle.go#L567-L567) 的 `TODO: do any needed authentication` 至今未实现，任何人可伪造 Like/Follow 写入 `remote_likes`/`remotefollows`。与 Webmention「回源验证 source 真链向 target」的安全意图形成对照。
-2. **入站提及（Create+Mention）不被处理**：缺 `CreateCallback`，[`activitypub.go#L549-L559`](./activitypub.go#L549-L559) 仅回 200。真正「提及了我」的语义在入站侧缺失；出站侧的 Mention 标签构建见 [`posts.go#L1281-L1299`](./posts.go#L1281-L1299) 与发送逻辑 [`activitypub.go#L971-L994`](./activitypub.go#L971-L994)（出站，非本主题）。
-3. **Delete 是「假删除」**：[`activitypub.go#L539-L547`](./activitypub.go#L539-L547) 不清理本地 like/follow 记录。
-4. **Follow 落库在异步 goroutine**：[`activitypub.go#L639`](./activitypub.go#L639-L639) `go func()`，且先 `time.Sleep(2s)` 再发 Accept 后写库，排查「收到 Follow 但 follower 未即时入库」时需注意这段延迟与异步特性。
-5. **回显仅计数、仅博主可见**：[`collection-post.tmpl#L58`](./templates/collection-post.tmpl#L58-L58) 受 `.IsOwner` 包裹，访客看不到点赞数。
+2. **object IRI 不校验 host，draft post 形式连 DB 校验都没有**：[`parsePostIDFromURL`](./activitypub.go#L1206-L1232) 的正则只匹配路径尾部，不校验 scheme/host。collection post 形式虽然靠 `GetCollection`+`GetPost` 的数据存在性查询间接过滤，但攻击者知道内部 alias/slug 即可定向伪造；draft post 形式（`/api/posts/{id}`）连这个间接过滤都没有，正则匹配上就直接用 ID，理论上可以对任意猜测的 ID 写入/删除 `remote_likes`。
+3. **Follow 的 object 完全不校验**：[`activitypub.go#L452-L463`](./activitypub.go#L452-L463) 只拿 `GetObjectIRI` 填 Accept 活动的 actor 字段，不校验 host、不校验是否为本地 collection、不校验是否匹配 URL 路径中的 `{alias}`。伪造的 object IRI 会被原样回写到 Accept 活动中发给远端。
+4. **不校验 actor 与 object 的关系**：Like/Unlike/Follow/Undo:Follow 分支都只分别校验 actor 和 object 各自「看起来合法」，但完全不检查「这个 actor 是否有理由对这个 object 做这个操作」（例如 actor 是否真的之前赞过、是否有权限取消赞）。结合无签名校验，伪造成本为零。
+5. **入站提及（Create+Mention）不被处理**：缺 `CreateCallback`，[`activitypub.go#L549-L559`](./activitypub.go#L549-L559) 仅回 200。真正「提及了我」的语义在入站侧缺失；出站侧的 Mention 标签构建见 [`posts.go#L1281-L1299`](./posts.go#L1281-L1299) 与发送逻辑 [`activitypub.go#L971-L994`](./activitypub.go#L971-L994)（出站，非本主题）。
+6. **Delete 是「假删除」**：[`activitypub.go#L539-L547`](./activitypub.go#L539-L547) 不清理本地 like/follow 记录。
+7. **Follow 落库在异步 goroutine**：[`activitypub.go#L639`](./activitypub.go#L639-L639) `go func()`，且先 `time.Sleep(2s)` 再发 Accept 后写库，排查「收到 Follow 但 follower 未即时入库」时需注意这段延迟与异步特性。
+8. **回显仅计数、仅博主可见**：[`collection-post.tmpl#L58`](./templates/collection-post.tmpl#L58-L58) 受 `.IsOwner` 包裹，访客看不到点赞数。
